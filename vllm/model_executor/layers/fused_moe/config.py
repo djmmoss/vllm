@@ -877,6 +877,9 @@ class FusedMoEConfig:
 
     is_lora_enabled: bool = False
 
+    # Need to cache this here to avoid dynamo calling importlib.util.find_spec
+    has_flashinfer_cutlass_fused_moe: bool = has_flashinfer_cutlass_fused_moe()
+
     def __post_init__(self):
         if self.dp_size > 1:
             logger.debug_once(
@@ -932,6 +935,6 @@ class FusedMoEConfig:
         """
         return (
             envs.VLLM_USE_FLASHINFER_MOE_FP4
-            and has_flashinfer_cutlass_fused_moe()
+            and self.has_flashinfer_cutlass_fused_moe
             and envs.VLLM_FLASHINFER_MOE_BACKEND == "throughput"
         )
