@@ -21,12 +21,9 @@ $PIP_CMD install cmake torch ninja
 # build nvshmem
 pushd $WORKSPACE
 mkdir -p nvshmem_src
-wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz
-tar -xvf nvshmem_src_3.2.5-1.txz -C nvshmem_src --strip-components=1
+wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.4.5/source/nvshmem_src_cuda12-all-all-3.4.5.tar.gz
+tar -xvf nvshmem_src_cuda12-all-all-3.4.5.tar.gz -C nvshmem_src --strip-components=1
 pushd nvshmem_src
-wget https://github.com/deepseek-ai/DeepEP/raw/main/third-party/nvshmem.patch
-git init
-git apply -vvv nvshmem.patch
 
 # assume CUDA_HOME is set correctly
 if [ -z "$CUDA_HOME" ]; then
@@ -48,7 +45,7 @@ export NVSHMEM_UCX_SUPPORT=0
 export NVSHMEM_USE_NCCL=0
 export NVSHMEM_PMIX_SUPPORT=0
 export NVSHMEM_TIMEOUT_DEVICE_POLLING=0
-export NVSHMEM_USE_GDRCOPY=0
+export NVSHMEM_USE_GDRCOPY=1
 export NVSHMEM_IBRC_SUPPORT=0
 export NVSHMEM_BUILD_TESTS=0
 export NVSHMEM_BUILD_EXAMPLES=0
@@ -57,8 +54,9 @@ export NVSHMEM_BUILD_HYDRA_LAUNCHER=0
 export NVSHMEM_BUILD_TXZ_PACKAGE=0
 export NVSHMEM_TIMEOUT_DEVICE_POLLING=0
 
-cmake -G Ninja -S . -B $WORKSPACE/nvshmem_build/ -DCMAKE_INSTALL_PREFIX=$WORKSPACE/nvshmem_install
-cmake --build $WORKSPACE/nvshmem_build/ --target install
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=$WORKSPACE/nvshmem_install -DMAKE_CUDA_ARCHITECTURES="100;120"
+cd build
+make -j$(nproc) install
 
 popd
 
@@ -120,7 +118,8 @@ popd
 
 # build and install deepep, require pytorch installed
 pushd $WORKSPACE
-clone_repo "https://github.com/deepseek-ai/DeepEP" "DeepEP" "setup.py" "73b6ea4"
+# clone_repo "https://github.com/deepseek-ai/DeepEP" "DeepEP" "setup.py" "73b6ea4"
+clone_repo "https://github.com/fzyzcjy/DeepEP" "DeepEP" "setup.py" "gb200_blog_part_2"
 cd DeepEP
 export NVSHMEM_DIR=$WORKSPACE/nvshmem_install
 $PIP_CMD install --no-build-isolation -vvv -e .

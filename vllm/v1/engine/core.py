@@ -325,6 +325,10 @@ class EngineCore:
 
         return callback
 
+    def _maybe_publish_request_counts(self):
+        # implemented by subclasses
+        return
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -335,8 +339,10 @@ class EngineCore:
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
+            self._maybe_publish_request_counts()
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        self._maybe_publish_request_counts()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with self.log_error_detail(scheduler_output):
@@ -432,6 +438,7 @@ class EngineCore:
             # is non-empty.
             return None, False
 
+        self._maybe_publish_request_counts()
         # Block until the next result is available.
         future, scheduler_output = batch_queue.pop()
         with self.log_error_detail(scheduler_output):
@@ -604,9 +611,12 @@ class EngineCoreProc(EngineCore):
 
             self._init_data_parallel(vllm_config)
 
-            super().__init__(
-                vllm_config, executor_class, log_stats, executor_fail_callback
-            )
+            from vllm.config import set_current_vllm_config
+
+            with set_current_vllm_config(vllm_config):
+                super().__init__(
+                    vllm_config, executor_class, log_stats, executor_fail_callback
+                )
 
             # Background Threads and Queues for IO. These enable us to
             # overlap ZMQ socket IO with GPU since they release the GIL,
