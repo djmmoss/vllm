@@ -268,8 +268,8 @@ def flashinfer_alltoall_dispatch(
     orig_topk_weights_dtype = topk_weights.dtype
     alltoall_info, topk_ids, topk_weights, _ = (
         MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
-            topk_ids,
-            topk_weights,
+            topk_ids.to(torch.int32),
+            topk_weights.to(torch.float32),
             None,
             all2all_manager.prepare_workspace_tensor,
             max_num_token,
