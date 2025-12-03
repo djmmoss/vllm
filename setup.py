@@ -364,7 +364,7 @@ class precompiled_wheel_utils:
             variant = os.getenv("VLLM_PRECOMPILED_WHEEL_VARIANT", main_variant)
             commit = os.getenv(
                 "VLLM_PRECOMPILED_WHEEL_COMMIT",
-                precompiled_wheel_utils.get_base_commit_in_main_branch(),
+                "19bee6d12d985c231b16374c99836376fc0c5706",
             )
             print(f"Using precompiled wheel commit {commit} with variant {variant}")
             try_default = False
@@ -644,10 +644,8 @@ def get_nvcc_cuda_version() -> Version:
 def get_vllm_version() -> str:
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
-    if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
-        print(f"Overriding VLLM version with {env_version} from VLLM_VERSION_OVERRIDE")
-        os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
-        return get_version(write_to="vllm/_version.py")
+    os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = "0.0.0+custom"
+    return get_version(write_to="vllm/_version.py")
 
     version = get_version(write_to="vllm/_version.py")
     sep = "+" if "+" not in version else "."  # dev versions might contain +
