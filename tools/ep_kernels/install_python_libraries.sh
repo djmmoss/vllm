@@ -9,7 +9,7 @@ set -ex
 
 CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 PPLX_COMMIT_HASH=${PPLX_COMMIT_HASH:-"12cecfd"}
-DEEPEP_COMMIT_HASH=${DEEPEP_COMMIT_HASH:-"gb200_blog_part_2"}
+DEEPEP_COMMIT_HASH=${DEEPEP_COMMIT_HASH:-"hybrid-ep"}
 NVSHMEM_VER=3.4.5
 WORKSPACE=${WORKSPACE:-$(pwd)/ep_kernels_workspace}
 MODE=${MODE:-install}
@@ -184,7 +184,7 @@ do_build \
 
 # build DeepEP
 do_build \
-    "https://github.com/fzyzcjy/DeepEP" \
+    "https://github.com/deepseek-ai/DeepEP" \
     "DeepEP" \
     "setup.py" \
     "$DEEPEP_COMMIT_HASH" \
