@@ -8,7 +8,6 @@ from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
 from typing import TYPE_CHECKING, Any, cast
 
-import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -501,7 +500,6 @@ class Worker(WorkerBase):
             hidden_states, last_hidden_states = self.model_runner._dummy_run(
                 num_tokens=max_num_reqs,
                 skip_eplb=True,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)
@@ -549,39 +547,12 @@ class Worker(WorkerBase):
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        all_gather_tensors = {}
-        compilation_config = self.vllm_config.compilation_config
-        parallel_config = self.vllm_config.parallel_config
-
-        if (
-            parallel_config.pipeline_parallel_size > 1
-            and compilation_config.pass_config.enable_sp
-            and forward_pass
-        ):
-            # currently only supported by V1 GPUModelRunner
-            assert isinstance(self.model_runner, GPUModelRunner)
-            num_scheduled_tokens_np = np.array(
-                list(scheduler_output.num_scheduled_tokens.values()),
-                dtype=np.int32,
+        num_input_tokens = self.model_runner._get_num_input_tokens(num_scheduled_tokens)
+        all_gather_tensors = {
+            "residual": not is_residual_scattered_for_sp(
+                self.vllm_config, num_input_tokens
             )
-            # TODO(lucas): This is pretty gross; ideally we should only ever call
-            # `_determine_batch_execution_and_padding` once (will get called again
-            # in `execute_model`) but this requires a larger refactor of PP.
-            _, batch_desc, _, _ = (
-                self.model_runner._determine_batch_execution_and_padding(
-                    num_tokens=num_scheduled_tokens,
-                    num_reqs=len(num_scheduled_tokens_np),
-                    num_scheduled_tokens_np=num_scheduled_tokens_np,
-                    max_num_scheduled_tokens=num_scheduled_tokens_np.max(),
-                    use_cascade_attn=False,  # TODO(lucas): Handle cascade attention
-                )
-            )
-            all_gather_tensors = {
-                "residual": not is_residual_scattered_for_sp(
-                    self.vllm_config, batch_desc.num_tokens
-                )
-            }
-
+        }
         if forward_pass and not get_pp_group().is_first_rank:
             tensor_dict = get_pp_group().recv_tensor_dict(
                 all_gather_group=get_tp_group(),

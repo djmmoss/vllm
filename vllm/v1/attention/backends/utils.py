@@ -75,7 +75,6 @@ class CommonAttentionMetadata:
 
     num_reqs: int
     """Number of requests"""
-    # TODO(lucas): rename to num_tokens since it may be padded and this is misleading
     num_actual_tokens: int
     """Total number of tokens in batch"""
     max_query_len: int
@@ -887,9 +886,7 @@ def split_decodes_and_prefills(
     if require_uniform:
         is_prefill = query_lens != query_lens[0]
     else:
-        # 0-query len indicates a padded request; leave this at the back
-        # of the batch with the prefills
-        is_prefill = (query_lens > decode_threshold) | (query_lens == 0)
+        is_prefill = query_lens > decode_threshold
 
     if not torch.any(is_prefill):
         return num_reqs, 0, num_tokens, 0
