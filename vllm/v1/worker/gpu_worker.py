@@ -548,28 +548,23 @@ class Worker(WorkerBase):
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         num_input_tokens = self.model_runner._get_num_input_tokens(num_scheduled_tokens)
+        # TODO(lucas): This is pretty gross; ideally we should only ever call
+        # `_determine_batch_execution_and_padding` once (will get called again
+        # in `execute_model`) but this requires a larger refactor of PP.
+        _, batch_desc, _, _, _ = (
+            self.model_runner._determine_batch_execution_and_padding(
+                num_tokens=num_scheduled_tokens,
+                num_reqs=len(num_scheduled_tokens_np),
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                max_num_scheduled_tokens=num_scheduled_tokens_np.max(),
+                use_cascade_attn=False,  # TODO(lucas): Handle cascade attention
+            )
+        )
         all_gather_tensors = {
             "residual": not is_residual_scattered_for_sp(
-                self.vllm_config, num_input_tokens
+                self.vllm_config, batch_desc.num_tokens
             )
-            # TODO(lucas): This is pretty gross; ideally we should only ever call
-            # `_determine_batch_execution_and_padding` once (will get called again
-            # in `execute_model`) but this requires a larger refactor of PP.
-            _, batch_desc, _, _, _ = (
-                self.model_runner._determine_batch_execution_and_padding(
-                    num_tokens=num_scheduled_tokens,
-                    num_reqs=len(num_scheduled_tokens_np),
-                    num_scheduled_tokens_np=num_scheduled_tokens_np,
-                    max_num_scheduled_tokens=num_scheduled_tokens_np.max(),
-                    use_cascade_attn=False,  # TODO(lucas): Handle cascade attention
-                )
-            )
-            all_gather_tensors = {
-                "residual": not is_residual_scattered_for_sp(
-                    self.vllm_config, batch_desc.num_tokens
-                )
-            }
-
+        }
         if forward_pass and not get_pp_group().is_first_rank:
             tensor_dict = get_pp_group().recv_tensor_dict(
                 all_gather_group=get_tp_group(),
