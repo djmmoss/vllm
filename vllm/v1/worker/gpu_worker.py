@@ -8,7 +8,6 @@ from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
 from typing import TYPE_CHECKING, Any, cast
 
-import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -269,7 +268,10 @@ class Worker(WorkerBase):
     # to hijack tensor allocation.
     def load_model(self) -> None:
         eep_scale_up = os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1"
-        with self._maybe_get_memory_pool_context(tag="weights") and set_current_vllm_config(self.vllm_config):
+        with (
+            self._maybe_get_memory_pool_context(tag="weights"),
+            set_current_vllm_config(self.vllm_config),
+        ):
             self.model_runner.load_model(eep_scale_up=eep_scale_up)
 
     def update_config(self, overrides: dict[str, Any]) -> None:
@@ -498,7 +500,6 @@ class Worker(WorkerBase):
             hidden_states, last_hidden_states = self.model_runner._dummy_run(
                 num_tokens=max_num_reqs,
                 skip_eplb=True,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)
@@ -546,20 +547,10 @@ class Worker(WorkerBase):
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        all_gather_tensors = {}
-        compilation_config = self.vllm_config.compilation_config
-        parallel_config = self.vllm_config.parallel_config
-
-        if (
-            parallel_config.pipeline_parallel_size > 1
-            and compilation_config.pass_config.enable_sp
-            and forward_pass
-        ):
-            # currently only supported by V1 GPUModelRunner
-            assert isinstance(self.model_runner, GPUModelRunner)
-            num_scheduled_tokens_np = np.array(
-                list(scheduler_output.num_scheduled_tokens.values()),
-                dtype=np.int32,
+        num_input_tokens = self.model_runner._get_num_input_tokens(num_scheduled_tokens)
+        all_gather_tensors = {
+            "residual": not is_residual_scattered_for_sp(
+                self.vllm_config, num_input_tokens
             )
             # TODO(lucas): This is pretty gross; ideally we should only ever call
             # `_determine_batch_execution_and_padding` once (will get called again

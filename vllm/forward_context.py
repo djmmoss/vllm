@@ -33,27 +33,23 @@ class BatchDescriptor(NamedTuple):
     """
 
     num_tokens: int
-    num_reqs: int | None = None
+    uniform_decode: bool = False
     """
-    Number of requests in the batch. Can be None for PIECEWISE cudagraphs where
-    the cudagraphs can handle any number of requests.
-    """
-    uniform: bool = False
-    """
-    True if all the requests in the batch have the same number of tokens.
+    False can also be used for an uniform decode batch to dispatch to the 
+    cudagraph supporting non-uniform batches.
     """
     has_lora: bool = False
     """
     Whether this batch has active LoRA adapters.
     """
 
-    def relax_for_mixed_batch_cudagraphs(self) -> "BatchDescriptor":
+    @property
+    def non_uniform(self) -> "BatchDescriptor":
         """
-        Return a relaxed version of current batch descriptor that is still compatible
-        with PIECEWISE cudagraphs (or mixed prefill-decode FA cudagraphs).
+        Return a non-uniform version of current batch descriptor.
         """
         return BatchDescriptor(
-            self.num_tokens, num_reqs=None, uniform=False, has_lora=self.has_lora
+            self.num_tokens, uniform_decode=False, has_lora=self.has_lora
         )
 
 

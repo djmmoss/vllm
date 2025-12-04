@@ -75,7 +75,6 @@ class CommonAttentionMetadata:
 
     num_reqs: int
     """Number of requests"""
-    # TODO(lucas): rename to num_tokens since it may be padded and this is misleading
     num_actual_tokens: int
     """Total number of tokens in batch"""
     max_query_len: int
@@ -166,7 +165,9 @@ def _make_metadata_with_slice(
     assert start_locs[first_req] <= first_tok < start_locs[first_req + 1], (
         "Token slice start outside of first request"
     )
-    # NOTE: last token can be outside of the last request if we have CG padding.
+    assert start_locs[last_req] <= last_tok < start_locs[last_req + 1], (
+        "Token slice end outside of last request"
+    )
 
     # If the "middle" request has tokens in both ubatches, we have to split it.
     # If ubatch_slice is the first ubatch then we will be splitting the last
@@ -885,9 +886,7 @@ def split_decodes_and_prefills(
     if require_uniform:
         is_prefill = query_lens != query_lens[0]
     else:
-        # 0-query len indicates a padded request; leave this at the back
-        # of the batch with the prefills
-        is_prefill = (query_lens > decode_threshold) | (query_lens == 0)
+        is_prefill = query_lens > decode_threshold
 
     if not torch.any(is_prefill):
         return num_reqs, 0, num_tokens, 0
