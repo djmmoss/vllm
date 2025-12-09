@@ -367,14 +367,19 @@ def flashinfer_trtllm_fp4_routed_moe(
     packed_tensor = (topk_ids.to(torch.int32) << 16) | topk_weights.to(
         torch.bfloat16
     ).view(torch.int16)
-
+    
     # Quantize input to FP4
-    a1_gscale = layer.w13_input_scale_quant
-    (hidden_states_fp4, hidden_states_scale_linear_fp4) = flashinfer.fp4_quantize(
-        x,
-        a1_gscale,
-        is_sf_swizzled_layout=False,
-    )
+    if isinstance(x, tuple):
+        hidden_states_fp4, hidden_states_scale_linear_fp4 = x
+    else:
+        # hidden_states is the already quantized
+        a1_gscale = layer.w13_input_scale_quant
+        (hidden_states_fp4, hidden_states_scale_linear_fp4) = flashinfer.fp4_quantize(
+            x,
+            a1_gscale,
+            is_sf_swizzled_layout=False,
+        )
+
 
     # Call TRT-LLM FP4 block-scale MoE kernel
     out = flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(

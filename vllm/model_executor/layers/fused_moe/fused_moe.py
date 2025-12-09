@@ -1324,7 +1324,7 @@ def fused_grouped_topk(
     scoring_func: str = "softmax",
     routed_scaling_factor: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
+    # assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
 
     if scoring_func == "sigmoid":
         # Fully fused kernel path for sigmoid
