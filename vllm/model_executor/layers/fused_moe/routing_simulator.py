@@ -109,6 +109,8 @@ class DistributionBasedRouting(RoutingStrategy):
             - topk_weights: Weights based on distribution sampling
             - topk_ids: Expert indices sampled from the distribution
         """
+        if isinstance(hidden_states, tuple):
+            hidden_states, _ = hidden_states
         num_tokens = hidden_states.shape[0]
         num_experts = router_logits.shape[-1]
 
