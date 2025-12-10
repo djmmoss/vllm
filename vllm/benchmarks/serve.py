@@ -509,6 +509,7 @@ async def benchmark(
     ramp_up_start_rps: int | None = None,
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
+    num_skip_requests: int = 0,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -732,10 +733,51 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
+    # Handle num_skip_requests: skip the first N and last N requests for metrics
+    measured_outputs = outputs
+    measured_input_requests = input_requests
+    if num_skip_requests > 0:
+        if num_skip_requests * 2 >= len(outputs):
+            raise ValueError(
+                f"num_skip_requests ({num_skip_requests}) is too large. "
+                f"Need at least {num_skip_requests * 2 + 1} requests but only "
+                f"have {len(outputs)}."
+            )
+
+        # Find when warmup period ends (when the last skipped request completes)
+        warmup_outputs = outputs[:num_skip_requests]
+        successful_warmup = [o for o in warmup_outputs if o.success]
+        if successful_warmup:
+            warmup_end_time = max(
+                o.start_time + o.latency for o in successful_warmup
+            )
+        else:
+            # If all warmup requests failed, use the first measured request start
+            warmup_end_time = benchmark_start_time
+
+        # Skip first N and last N requests
+        measured_outputs = outputs[num_skip_requests:-num_skip_requests]
+        measured_input_requests = input_requests[num_skip_requests:-num_skip_requests]
+
+        # Calculate duration from warmup end to last measured completion
+        successful_measured = [o for o in measured_outputs if o.success]
+        if successful_measured:
+            last_end_time = max(
+                o.start_time + o.latency for o in successful_measured
+            )
+            benchmark_duration = last_end_time - warmup_end_time
+        else:
+            benchmark_duration = 0
+
+        print(
+            f"Skipped first {num_skip_requests} and last {num_skip_requests} requests. "
+            f"Measuring {len(measured_outputs)} requests."
+        )
+
     if task_type == TaskType.GENERATION:
         metrics, actual_output_lens = calculate_metrics(
-            input_requests=input_requests,
-            outputs=outputs,
+            input_requests=measured_input_requests,
+            outputs=measured_outputs,
             dur_s=benchmark_duration,
             tokenizer=tokenizer,
             selected_percentiles=selected_percentiles,
@@ -743,7 +785,7 @@ async def benchmark(
         )
     else:
         metrics = calculate_metrics_for_embeddings(
-            outputs=outputs,
+            outputs=measured_outputs,
             dur_s=benchmark_duration,
             selected_percentiles=selected_percentiles,
         )
@@ -804,12 +846,12 @@ async def benchmark(
             "request_goodput": metrics.request_goodput if goodput_config_dict else None,
             "output_throughput": metrics.output_throughput,
             "total_token_throughput": metrics.total_token_throughput,
-            "input_lens": [output.prompt_len for output in outputs],
+            "input_lens": [output.prompt_len for output in measured_outputs],
             "output_lens": actual_output_lens,
-            "ttfts": [output.ttft for output in outputs],
-            "itls": [output.itl for output in outputs],
-            "generated_texts": [output.generated_text for output in outputs],
-            "errors": [output.error for output in outputs],
+            "ttfts": [output.ttft for output in measured_outputs],
+            "itls": [output.itl for output in measured_outputs],
+            "generated_texts": [output.generated_text for output in measured_outputs],
+            "errors": [output.error for output in measured_outputs],
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
@@ -820,8 +862,8 @@ async def benchmark(
             "total_input_tokens": metrics.total_input,
             "request_throughput": metrics.request_throughput,
             "total_token_throughput": metrics.total_token_throughput,
-            "input_lens": [output.prompt_len for output in outputs],
-            "errors": [output.error for output in outputs],
+            "input_lens": [output.prompt_len for output in measured_outputs],
+            "errors": [output.error for output in measured_outputs],
         }
 
     if rps_change_events:
@@ -1299,6 +1341,15 @@ def add_cli_args(parser: argparse.ArgumentParser):
         type=json.loads,
         default=None,
     )
+    parser.add_argument(
+        "--num-skip-requests",
+        type=int,
+        default=0,
+        help="Number of requests to skip at the beginning and end of the "
+        "benchmark for metrics calculation. If set to N, the first N and "
+        "last N requests will be excluded from metrics. This is different "
+        "from --num-warmups which sends separate warmup requests.",
+    )
 
 
 def main(args: argparse.Namespace) -> dict[str, Any]:
@@ -1451,6 +1502,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ramp_up_start_rps=args.ramp_up_start_rps,
         ramp_up_end_rps=args.ramp_up_end_rps,
         ready_check_timeout_sec=args.ready_check_timeout_sec,
+        num_skip_requests=args.num_skip_requests,
     )
 
     # Save config and results to json
@@ -1483,6 +1535,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     )
     result_json["burstiness"] = args.burstiness
     result_json["max_concurrency"] = args.max_concurrency
+    result_json["num_skip_requests"] = args.num_skip_requests
 
     if args.ramp_up_strategy is not None:
         result_json["ramp_up_strategy"] = args.ramp_up_strategy
