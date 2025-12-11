@@ -281,7 +281,7 @@ def supports_trtllm_attention() -> bool:
         return False
 
     # Requires SM100 and NVIDIA artifactory to be accessible to download cubins
-    return current_platform.is_device_capability(100) and has_nvidia_artifactory()
+    return current_platform.has_device_capability(100) and has_nvidia_artifactory()
 
 
 @functools.cache
