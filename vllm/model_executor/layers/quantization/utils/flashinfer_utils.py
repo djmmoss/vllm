@@ -307,5 +307,6 @@ def is_flashinfer_supporting_global_sf(backend: FlashinferMoeBackend | None) -> 
     backends_supporting_global_sf = (
         FlashinferMoeBackend.CUTLASS,
         FlashinferMoeBackend.TENSORRT_LLM,
+        FlashinferMoeBackend.CUTEDSL,
     )
     return backend in backends_supporting_global_sf
