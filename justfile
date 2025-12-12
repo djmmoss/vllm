@@ -41,95 +41,97 @@ export FLASHINFER_CACHE_DIR := "/data/nfs01/ming/.cache/flashinfer/"
 # vLLM Environment Variables
 # ------------------------------------------------------------------------------
 
-COMMON_ENV := '''
-CUDA_HOME=/usr/local/cuda \
-LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH \
+SYSTEM_ENV := '''
+NVIDIA_GDRCOPY=1 \
+NVSHMEM_IB_ENABLE_IBGDA=1 \
+NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=enP22p3s0f1np1 \
+UCX_IB_ROCE_REACHABILITY_MODE=local_subnet \
+VLLM_SKIP_P2P_CHECK=1 \
+GLOO_SOCKET_IFNAME=enP22p3s0f1np1 \
+NCCL_SOCKET_IFNAME=enP22p3s0f1np1 \
 NCCL_CUMEM_ENABLE=1 \
 NCCL_MNNVL_ENABLE=1 \
 NCCL_NVLS_ENABLE=1 \
-NVSHMEM_IB_ENABLE_IBGDA=1 \
+CUDA_HOME=/usr/local/cuda \
+LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH \
 PATH=/usr/local/cuda/bin:$PATH \
 UCX_TLS=all \
-VLLM_ATTENTION_BACKEND=FLASHINFER_MLA \
-VLLM_DISABLE_FLASHINFER_PREFILL=0 \
-VLLM_FORCE_TORCH_ALLREDUCE=1 \
 VLLM_LOGGING_LEVEL=INFO \
 VLLM_NIXL_ABORT_REQUEST_TIMEOUT=300 \
 VLLM_NIXL_SIDE_CHANNEL_HOST=`hostname -i` \
 VLLM_NIXL_SIDE_CHANNEL_PORT=5700 \
 VLLM_TORCH_PROFILER_DIR=./profile/ \
 VLLM_USE_DEEP_GEMM=0 \
-VLLM_USE_FLASHINFER_MOE_FP4=1 \
-VLLM_USE_FLASHINFER_MOE_FP8=1 \
-VLLM_USE_FLASHINFER_SAMPLER=1 \
-VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL=1 \
-VLLM_V1_OUTPUT_PROC_CHUNK_SIZE=2048 \
+'''
+
+COMMON_VLLM_ENV := '''
 VLLM_RANDOMIZE_DP_DUMMY_INPUTS=1 \
-VLLM_MOE_DP_CHUNK_SIZE=1024 \
-'''
-
-PREFILL_ENV := COMMON_ENV + ''' \
-VLLM_ENABLE_MOE_DP_CHUNK=0 \
-VLLM_USE_NCCL_SYMM_MEM=1 \
-VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING=0 \
-VLLM_FLASHINFER_ALLREDUCE_FUSION_THRESHOLDS_MB='{"2":32,"4":32,"8":8}' \
-VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE=1 \
-VLLM_FLASHINFER_MOE_BACKEND=throughput \
-'''
-
-#CUTE_DSL_ARCH=sm_100a \
-#VLLM_EP_USE_SBO=1 \
-#VLLM_DEEPEPLL_NVFP4_DISPATCH=1 \
-DECODE_ENV := COMMON_ENV + ''' \
-VLLM_USE_STANDALONE_COMPILE=0 \
-VLLM_DEEPEP_BUFFER_SIZE_MB=0 \
-VLLM_DEEPEP_LOW_LATENCY_ALLOW_NVLINK=1 \
-VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL=1 \
+VLLM_ATTENTION_BACKEND=FLASHINFER_MLA \
+VLLM_USE_FLASHINFER_MOE_FP4=1 \
+VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL=1 \
 VLLM_FLASHINFER_MOE_BACKEND=latency \
+VLLM_USE_NCCL_SYMM_MEM=1 \
 '''
+
+PREFILL_VLLM_ENV := SYSTEM_ENV + COMMON_VLLM_ENV
+PREFILL_PD_VLLM_ENV := PREFILL_VLLM_ENV + PD_VLLM_ENV
+DECODE_VLLM_ENV := SYSTEM_ENV + COMMON_VLLM_ENV
+DECODE_PD_VLLM_ENV := DECODE_VLLM_ENV + PD_VLLM_ENV
+
+PREFILL_ENV := PREFILL_VLLM_ENV
+DECODE_ENV := DECODE_VLLM_ENV
 
 # ------------------------------------------------------------------------------
 # vLLM Arguments
 # ------------------------------------------------------------------------------
 
-COMMON_ARGS := '''
---async-scheduling \
---disable_custom_all_reduce \
---disable-uvicorn-access-log \
---disable_nccl_for_dp_synchronization \
---enable-expert-parallel \
+COMMON_VLLM_ARGS := '''
 --kv-cache-dtype fp8 \
---kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}' \
 --tensor-parallel-size 1 \
---trust-remote-code \
-'''
-
-PREFILL_ARGS := COMMON_ARGS + ''' \
---all2all-backend allgather_reducescatter \
---compilation_config.custom_ops+=+quant_fp8,+rms_norm \
---compilation_config.pass_config.enable_attn_fusion true \
---compilation_config.pass_config.enable_fi_allreduce_fusion true \
---compilation_config.pass_config.enable_noop true \
---gpu-memory-utilization 0.85 \
+--pipeline-parallel-size 1 \
+--enable-expert-parallel \
+--data-parallel-rpc-port 13345 \
 --max-model-len 4096 \
---max-num-batched-tokens 32768 \
---max-num-seqs 1024 \
---no-enable-prefix-caching \
---swap-space 16 \
---trust-remote-code \
-'''
-
-DECODE_ARGS := COMMON_ARGS + ''' \
---all2all-backend deepep_low_latency \
---compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":2048}' \
---data-parallel-hybrid-lb \
---data-parallel-size 8 \
 --data-parallel-size-local 4 \
---gpu-memory-utilization 0.9 \
---max-model-len 4096 \
---max-num-batched-tokens 16384 \
---max-num-seqs 2048 \
+--disable-uvicorn-access-log \
+--no-enable-prefix-caching \
+--port 8087 \
+--async-scheduling \
+--disable-uvicorn-access-log \
+--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}' \
+--trust-remote-code \
 '''
+
+PREFILL_VLLM_ARGS := COMMON_VLLM_ARGS + '''
+--swap-space 16 \
+--max-num-seqs 128 \
+--compilation-config '{"cudagraph_mode":"NONE"}' \
+--gpu-memory-utilization 0.85 \
+--max-num-batched-tokens 32768 \
+--compilation_config.pass_config.enable_fi_allreduce_fusion true \
+--compilation_config.pass_config.enable_attn_fusion true \
+--compilation_config.pass_config.enable_noop true \
+--compilation_config.custom_ops+=+quant_fp8,+rms_norm \
+--enable-eplb \
+--eplb-config '{"window_size":"100", "step_interval":"500", "num_redundant_experts":"32", "log_balancedness":"False"}' \
+'''
+
+PREFILL_PD_VLLM_ARGS := PREFILL_VLLM_ARGS + PD_VLLM_ARGS
+PREFILL_ARGS := PREFILL_VLLM_ARGS
+
+DECODE_VLLM_ARGS := COMMON_VLLM_ARGS + '''
+--all2all-backend allgather_reducescatter \
+--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+--data-parallel-hybrid-lb \
+--gpu-memory-utilization 0.9 \
+--stream-interval 50 \
+--max-num-seqs 1024 \
+--max-num-batched-tokens 16384 \
+--max-cudagraph-capture-size 2048 \
+'''
+
+DECODE_PD_VLLM_ARGS := DECODE_VLLM_ARGS + PD_VLLM_ARGS
+DECODE_ARGS := DECODE_VLLM_ARGS
 
 # ==============================================================================
 # vLLM Recipes
