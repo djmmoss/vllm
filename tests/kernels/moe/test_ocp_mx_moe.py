@@ -460,7 +460,6 @@ def tg_mxfp4_moe(
         local_expert_offset=0,
         local_num_experts=num_experts,
         routed_scaling_factor=None,
-        tile_tokens_dim=get_tile_tokens_dim(hidden_states, topk, num_experts),
         routing_method_type=1,  # renormalize
         do_finalize=True,
     )[0]
