@@ -1,0 +1,101 @@
+import "../recipes.just"
+
+# -------
+# CONFIG
+# ------
+
+MODEL := "/ds-models/DeepSeek-R1-0528-FP4-v2"
+PREC := "fp4"
+LYRIS_IFNAME := "enP22p3s0f1np1"
+PTYCHE_IFNAME := "enP6p3s0f1np1"
+
+# ---
+# ENV
+# ---
+
+SYSTEM_ENV := '''NVIDIA_GDRCOPY=1 \
+NVSHMEM_IB_ENABLE_IBGDA=1 \
+NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=enP22p3s0f1np1 \
+UCX_IB_ROCE_REACHABILITY_MODE=local_subnet \
+VLLM_SKIP_P2P_CHECK=1 \
+GLOO_SOCKET_IFNAME=enP22p3s0f1np1 \
+NCCL_SOCKET_IFNAME=enP22p3s0f1np1 \
+NCCL_CUMEM_ENABLE=1 \
+NCCL_MNNVL_ENABLE=1 \
+NCCL_NVLS_ENABLE=1 '''
+
+
+COMMON_VLLM_ENV := '''\
+VLLM_RANDOMIZE_DP_DUMMY_INPUTS=1 \
+VLLM_ATTENTION_BACKEND=FLASHINFER_MLA \
+VLLM_USE_FLASHINFER_MOE_FP4=1 \
+VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL=1 \
+VLLM_FLASHINFER_MOE_BACKEND=latency \
+VLLM_USE_NCCL_SYMM_MEM=1 '''
+
+# Currently there is no prefill or decode specific environment variables
+PREFILL_VLLM_ENV := SYSTEM_ENV + COMMON_VLLM_ENV 
+PREFILL_PD_VLLM_ENV := PREFILL_VLLM_ENV + PD_VLLM_ENV
+
+DECODE_VLLM_ENV := SYSTEM_ENV + COMMON_VLLM_ENV
+DECODE_PD_VLLM_ENV := DECODE_VLLM_ENV + PD_VLLM_ENV
+
+# ---------
+# vLLM Args
+# ---------
+
+COMMON_VLLM_ARGS := '''
+--kv-cache-dtype fp8 \
+--tensor-parallel-size 1 \
+--pipeline-parallel-size 1 \
+--enable-expert-parallel \
+--data-parallel-rpc-port 13345 \
+--max-model-len 4096 \
+--disable-uvicorn-access-log \
+--no-enable-prefix-caching \
+--port 8087 \
+--async-scheduling '''
+
+PREFILL_VLLM_ARGS := COMMON_VLLM_ARGS + '''\
+--async-scheduling \
+--disable_custom_all_reduce \
+--disable-uvicorn-access-log \
+--disable_nccl_for_dp_synchronization \
+--enable-expert-parallel \
+--kv-cache-dtype fp8 \
+--tensor-parallel-size 1 \
+--trust-remote-code \
+--all2all-backend allgather_reducescatter \
+--compilation_config.custom_ops+=+quant_fp8,+rms_norm,+rotary_embedding \
+--compilation_config.pass_config.enable_attn_fusion true \
+--compilation_config.pass_config.enable_fi_allreduce_fusion true \
+--compilation_config.pass_config.enable_noop true \
+--gpu-memory-utilization 0.85 \
+--max-model-len 4096 \
+--max-num-batched-tokens 65536 \
+--max-num-seqs 1024 \
+--no-enable-prefix-caching \
+--swap-space 16 \
+--trust-remote-code \
+--data-parallel-size 2 \
+--enforce-eager \
+--offload-group-size 2 \
+--offload-num-in-group 1 \
+--offload-prefetch-step 1 \
+ '''
+
+PREFILL_PD_VLLM_ARGS := PREFILL_VLLM_ARGS + PD_VLLM_ARGS
+
+DECODE_VLLM_ARGS := COMMON_VLLM_ARGS + '''\
+--all2all-backend allgather_reducescatter \
+--compilation-config.cudagraph_mode FULL_DECODE_ONLY \
+--compilation_config.custom_ops+=+rms_norm,+rotary_embedding \
+--data-parallel-hybrid-lb \
+--gpu-memory-utilization 0.9 \
+--data-parallel-size-local 4 \
+--stream-interval 50 \
+--max-num-seqs 1024 \
+--max-num-batched-tokens 8192 \
+--max-cudagraph-capture-size 1024 '''
+
+DECODE_PD_VLLM_ARGS := DECODE_VLLM_ARGS + PD_VLLM_ARGS
