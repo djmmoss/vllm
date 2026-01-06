@@ -493,7 +493,7 @@ def use_flashinfer_prefill() -> bool:
         and flashinfer_available
         and not envs.VLLM_USE_CUDNN_PREFILL
         and not envs.VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL
-        and current_platform.is_device_capability(100)
+        and current_platform.has_device_capability(100)
     )
 
 
@@ -501,7 +501,7 @@ def use_cudnn_prefill() -> bool:
     return (
         flashinfer_available
         and envs.VLLM_USE_CUDNN_PREFILL
-        and current_platform.is_device_capability(100)
+        and current_platform.has_device_capability(100)
         and has_nvidia_artifactory()
     )
 
@@ -511,7 +511,7 @@ def use_trtllm_ragged_deepseek_prefill() -> bool:
     return (
         flashinfer_available
         and envs.VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL
-        and current_platform.is_device_capability(100)
+        and current_platform.has_device_capability(100)
     )
 
 
