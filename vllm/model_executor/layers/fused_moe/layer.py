@@ -45,6 +45,8 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    FlashinferMoeBackend,
+    get_flashinfer_moe_backend,
     is_flashinfer_supporting_global_sf,
 )
 from vllm.platforms import current_platform
@@ -1943,10 +1945,14 @@ class FusedMoE(CustomOp):
 
                 post_quant_allgather = (
                     has_flashinfer_trtllm_fused_moe()
+                    and get_flashinfer_moe_backend()
+                    == FlashinferMoeBackend.TENSORRT_LLM
                     and self.quant_method is not None
                     and self.dp_size > 1
                     and self.use_ep
                     and isinstance(self.quant_method, ModelOptNvFp4FusedMoE)
+                    and self.moe_parallel_config.all2all_backend
+                    == "allgather_reducescatter"
                 )
                 if post_quant_allgather:
                     hidden_states_to_dispatch, extra_tensors = (
