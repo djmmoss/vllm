@@ -15,6 +15,7 @@ from typing import Any, TypeVar, cast
 
 import msgspec
 import zmq
+import torch.cuda.profiler as profiler
 
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
@@ -169,6 +170,20 @@ class EngineCore:
                     if worker_dict is not None:
                         content.update(worker_dict)
                 kv_connector.set_xfer_handshake_metadata(content)
+
+        
+        # cudaProfilerApi Support
+        self._perf_iter = 0
+        self._profiler_running = False
+        _perf_env_str = os.environ.get("VLLM_PROFILE_START_STOP", "None")
+        if '-' in _perf_env_str:
+            start, stop = _perf_env_str.strip().split('-')
+            self._start_perf_iter = int(start)
+            self._stop_perf_iter = int(stop)
+        else:
+            self._start_perf_iter = -1
+            self._stop_perf_iter = -1
+        logger.info(f"Profiler START-STOP: {self._start_perf_iter}-{self._stop_perf_iter}")
 
         # Setup batch queue for pipeline parallelism.
         # Batch queue for scheduled batches. This enables us to asynchronously
@@ -339,6 +354,18 @@ class EngineCore:
         was executed.
         """
 
+        # Profiler Start and Stop
+        if self._perf_iter == self._start_perf_iter:
+            logger.info(f"Starting profiler at {self._perf_iter}")
+            profiler.start()
+            self._profiler_running = True
+
+        if self._perf_iter == self._stop_perf_iter:
+            logger.info(f"Stopping profiler at {self._perf_iter}")
+            profiler.stop()
+            self._profiler_running = False
+        self._perf_iter += 1
+
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
@@ -385,6 +412,19 @@ class EngineCore:
         batch in the job queue is finished.
         3. Update the scheduler from the output.
         """
+
+        # Profiler Start and Stop
+        if self._perf_iter == self._start_perf_iter:
+            logger.info(f"Starting profiler at {self._perf_iter}")
+            profiler.start()
+            self._profiler_running = True
+
+        if self._perf_iter == self._stop_perf_iter:
+            logger.info(f"Stopping profiler at {self._perf_iter}")
+            profiler.stop()
+            self._profiler_running = False
+        self._perf_iter += 1
+
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
@@ -466,6 +506,10 @@ class EngineCore:
         return engine_core_outputs, model_executed
 
     def shutdown(self):
+        # Check if profiler is running
+        if self._profiler_running:
+            logger.info(f"Stopping profiler at {self._perf_iter}")
+            profiler.stop()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
