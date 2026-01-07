@@ -93,6 +93,8 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self.should_profile = False
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -369,7 +371,11 @@ class EngineCore:
             logger.info(f"Stopping profiler at {self._perf_iter}")
             profiler.stop()
             self._profiler_running = False
-        self._perf_iter += 1
+        if not self.should_profile:
+            if self.scheduler.get_request_counts()[0] >= self.max_num_seqs:
+                self.should_profile = True
+        if self.should_profile:
+            self._perf_iter += 1
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
@@ -430,6 +436,11 @@ class EngineCore:
             profiler.stop()
             self._profiler_running = False
         self._perf_iter += 1
+        if not self.should_profile:
+            if self.scheduler.get_request_counts()[0] >= self.max_num_seqs:
+                self.should_profile = True
+        if self.should_profile:
+            self._perf_iter += 1
 
         batch_queue = self.batch_queue
         assert batch_queue is not None
