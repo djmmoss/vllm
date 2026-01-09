@@ -198,8 +198,6 @@ def flashinfer_cutedsl_moe_masked(
     workspace: torch.Tensor,
     out: torch.Tensor,
     w2_gemm_overlap_args=None,
-    fi_prof_buf1=None,
-    fi_prof_buf2=None,
 ):
     """
     Perform masked Mixture-of-Experts computation with FlashInfer's CuteDSL
@@ -352,8 +350,6 @@ def flashinfer_cutedsl_moe_masked(
             if w2_gemm_overlap_args is not None
             else {}
         ),
-        fi_prof_buf1=fi_prof_buf1,
-        fi_prof_buf2=fi_prof_buf2,
     )  # in logical [m, k, l]
     out = out.permute(2, 0, 1)
 
