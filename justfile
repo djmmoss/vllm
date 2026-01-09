@@ -38,6 +38,10 @@ VLLM_ENABLE_MOE_DP_CHUNK=0 \
 PREFILL_PD_VLLM_ENV := PREFILL_VLLM_ENV + PD_VLLM_ENV
 
 DECODE_VLLM_ENV := SYSTEM_ENV + COMMON_VLLM_ENV + '''\
+VLLM_DEEPEP_LOW_LATENCY_ALLOW_NVLINK=1 \
+VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL=1 \
+VLLM_DEEPEP_BUFFER_SIZE_MB=0 \
+VLLM_EP_USE_SBO=1 \
 VLLM_MOE_DP_CHUNK_SIZE=1024 \
 VLLM_DEEPEPLL_NVFP4_DISPATCH=1 \
 VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING=0 \
@@ -80,12 +84,12 @@ PREFILL_PD_VLLM_ARGS := PREFILL_VLLM_ARGS + PD_VLLM_ARGS
 
 DECODE_VLLM_ARGS := COMMON_VLLM_ARGS + '''\
 --all2all-backend deepep_low_latency \
---compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
---compilation_config.custom_ops+=+rms_norm,+rotary_embedding \
 --data-parallel-hybrid-lb \
 --stream-interval 50 \
 --max-num-seqs 1024 \
 --max-num-batched-tokens 2048 \
+--compilation_config.cudagraph_mode=FULL_DECODE_ONLY \
+--compilation_config.custom_ops+=+rms_norm,+rotary_embedding \
 --max-cudagraph-capture-size 1024 '''
 
 DECODE_PD_VLLM_ARGS := DECODE_VLLM_ARGS + PD_VLLM_ARGS
@@ -153,7 +157,7 @@ decode-master-pd DMA:
     vllm serve {{MODEL}} \
     {{DECODE_PD_VLLM_ARGS}} \
     --data-parallel-address {{DMA}} \
-    --data-parallel-size 4 \
+    --data-parallel-size 8 \
     2>&1 | tee decode-master-pd.log
 
 decode-worker-pd DMA DPSR:
