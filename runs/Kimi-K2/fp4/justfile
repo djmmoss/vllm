@@ -1,0 +1,84 @@
+import "../recipes.just"
+
+# -------
+# CONFIG
+# ------
+
+MODEL := "nvidia/Kimi-K2-Thinking-NVFP4"
+PREC := "fp4"
+LYRIS_IFNAME := "enP22p3s0f1np1"
+PTYCHE_IFNAME := "enP6p3s0f1np1"
+
+# ---
+# ENV
+# ---
+
+SYSTEM_ENV := '''NVIDIA_GDRCOPY=1 \
+NVSHMEM_IB_ENABLE_IBGDA=1 \
+NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=enP22p3s0f1np1 \
+UCX_IB_ROCE_REACHABILITY_MODE=local_subnet \
+VLLM_SKIP_P2P_CHECK=1 \
+GLOO_SOCKET_IFNAME=enP22p3s0f1np1 \
+NCCL_SOCKET_IFNAME=enP22p3s0f1np1 \
+NCCL_CUMEM_ENABLE=1 \
+NCCL_MNNVL_ENABLE=1 \
+NCCL_NVLS_ENABLE=1 '''
+
+
+COMMON_VLLM_ENV := '''\
+VLLM_ATTENTION_BACKEND=FLASHINFER_MLA \
+VLLM_USE_FLASHINFER_MOE_FP4=1 \
+VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL=1 \
+VLLM_FLASHINFER_MOE_BACKEND=latency \
+VLLM_USE_NCCL_SYMM_MEM=1 '''
+
+# Currently there is no prefill or decode specific environment variables
+PREFILL_VLLM_ENV := SYSTEM_ENV + COMMON_VLLM_ENV 
+PREFILL_PD_VLLM_ENV := PREFILL_VLLM_ENV + PD_VLLM_ENV
+
+DECODE_VLLM_ENV := SYSTEM_ENV + COMMON_VLLM_ENV
+DECODE_PD_VLLM_ENV := DECODE_VLLM_ENV + PD_VLLM_ENV
+
+# ---------
+# vLLM Args
+# ---------
+
+COMMON_VLLM_ARGS := '''
+--kv-cache-dtype fp8 \
+--tensor-parallel-size 1 \
+--pipeline-parallel-size 1 \
+--enable-expert-parallel \
+--data-parallel-rpc-port 13345 \
+--max-model-len 4096 \
+--data-parallel-size-local 4 \
+--disable-uvicorn-access-log \
+--no-enable-prefix-caching \
+--port 8087 \
+--trust_remote_code \
+--no-enable-chunked-prefill \
+--all2all-backend allgather_reducescatter \
+--data-parallel-hybrid-lb \
+--compilation_config.custom_ops+=+quant_fp8,+rms_norm,+rotary_embedding \
+--compilation_config.pass_config.enable_attn_fusion true \
+--compilation_config.pass_config.enable_fi_allreduce_fusion true \
+--compilation_config.pass_config.enable_noop true \
+--async-scheduling '''
+
+PREFILL_VLLM_ARGS := COMMON_VLLM_ARGS + '''\
+--swap-space 16 \
+--max-num-seqs 8 \
+--enforce-eager \
+--gpu-memory-utilization 0.9 \
+--max-num-batched-tokens 16384  '''
+
+PREFILL_PD_VLLM_ARGS := PREFILL_VLLM_ARGS + PD_VLLM_ARGS
+
+DECODE_VLLM_ARGS := COMMON_VLLM_ARGS + '''\
+--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+--gpu-memory-utilization 0.9 \
+--stream-interval 50 \
+--max-num-seqs 512 \
+--max-num-batched-tokens 4096 \
+--max-cudagraph-capture-size 512 '''
+
+DECODE_PD_VLLM_ARGS := DECODE_VLLM_ARGS + PD_VLLM_ARGS

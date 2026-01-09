@@ -54,7 +54,7 @@ srun --segment $SLURM_JOB_NUM_NODES --ntasks-per-node=1 sudo nvidia-smi -ac 3996
 srun --segment $SLURM_JOB_NUM_NODES \
   --container-image=/lustre/fsw/coreai_devtech_all/jiahanc/meta-dsr1-gb200/images/vllm-custom.sqsh \
   --container-mounts=/lustre/fsw/coreai_devtech_all/jiahanc/meta-dsr1-gb200:/scratch,/lustre/fsw/coreai_devtech_all/siyuanf/models:/ds-models \
-  --container-workdir=/scratch/runs/fp4 \
+  --container-workdir=/scratch/runs/DS-R1/fp4 \
   --mpi=pmix \
   bash -c "
 RANK=0
