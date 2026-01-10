@@ -86,6 +86,7 @@ PREFILL_VLLM_ARGS := COMMON_VLLM_ARGS + '''\
 PREFILL_PD_VLLM_ARGS := PREFILL_VLLM_ARGS + PD_VLLM_ARGS
 
 DECODE_VLLM_ARGS := COMMON_VLLM_ARGS + '''\
+--gpu-memory-utilization 0.82 \
 --all2all-backend deepep_low_latency \
 --data-parallel-hybrid-lb \
 --stream-interval 50 \
@@ -95,6 +96,8 @@ DECODE_VLLM_ARGS := COMMON_VLLM_ARGS + '''\
 --compilation_config.custom_ops+=+rms_norm,+rotary_embedding \
 --data-parallel-size 16 \
 --no-enforce-eager \
+--enable-eplb \
+--eplb-config '{"window_size":"100", "step_interval":"500", "num_redundant_experts":"16", "log_balancedness":"False"}' \
 --cudagraph-capture-size ''' + BATCH
 
 DECODE_PD_VLLM_ARGS := DECODE_VLLM_ARGS + PD_VLLM_ARGS
