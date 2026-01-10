@@ -3,6 +3,7 @@ HF_CACHE_HOME := "/data/numa0/ming_hf_cache/"
 export HF_HOME := HF_CACHE_HOME
 export FLASHINFER_CACHE_DIR := "/data/nfs01/ming/.cache/flashinfer/"
 PREC := "fp4"
+BATCH := "1536"
 
 # ---
 # ENV
@@ -37,13 +38,14 @@ VLLM_ENABLE_MOE_DP_CHUNK=0 \
 
 PREFILL_PD_VLLM_ENV := PREFILL_VLLM_ENV + PD_VLLM_ENV
 
+#VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random \
 DECODE_VLLM_ENV := SYSTEM_ENV + COMMON_VLLM_ENV + '''\
 VLLM_MLA_FP8_PROJ=1 \
 VLLM_DEEPEP_LOW_LATENCY_ALLOW_NVLINK=1 \
 VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL=1 \
 VLLM_DEEPEP_BUFFER_SIZE_MB=0 \
-VLLM_EP_USE_SBO=1 \
-VLLM_MOE_DP_CHUNK_SIZE=1024 \
+VLLM_EP_USE_SBO=0 \
+VLLM_MOE_DP_CHUNK_SIZE=1536 \
 VLLM_DEEPEPLL_NVFP4_DISPATCH=1 \
 VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING=0 \
 VLLM_V1_OUTPUT_PROC_CHUNK_SIZE=2048 \
@@ -87,11 +89,13 @@ DECODE_VLLM_ARGS := COMMON_VLLM_ARGS + '''\
 --all2all-backend deepep_low_latency \
 --data-parallel-hybrid-lb \
 --stream-interval 50 \
---max-num-seqs 1024 \
+--max-num-seqs ''' + BATCH + ''' \
 --max-num-batched-tokens 2048 \
 --compilation_config.cudagraph_mode=FULL_DECODE_ONLY \
 --compilation_config.custom_ops+=+rms_norm,+rotary_embedding \
---max-cudagraph-capture-size 1024 '''
+--data-parallel-size 16 \
+--no-enforce-eager \
+--cudagraph-capture-size ''' + BATCH
 
 DECODE_PD_VLLM_ARGS := DECODE_VLLM_ARGS + PD_VLLM_ARGS
 
@@ -99,12 +103,12 @@ DECODE_PD_VLLM_ARGS := DECODE_VLLM_ARGS + PD_VLLM_ARGS
 # PD
 # ---
 
-PD_VLLM_ENV := '''\
+PD_VLLM_ENV := ''' \
 VLLM_NIXL_SIDE_CHANNEL_HOST=`hostname -i` \
 VLLM_NIXL_SIDE_CHANNEL_PORT=5600 \
 VLLM_NIXL_ABORT_REQUEST_TIMEOUT=300 '''
 
-PD_VLLM_ARGS := '''\
+PD_VLLM_ARGS := ''' \
 --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both", "kv_load_failure_policy":"fail"}' '''
 
 # ----
@@ -158,7 +162,6 @@ decode-master-pd DMA:
     vllm serve {{MODEL}} \
     {{DECODE_PD_VLLM_ARGS}} \
     --data-parallel-address {{DMA}} \
-    --data-parallel-size 8 \
     2>&1 | tee decode-master-pd.log
 
 decode-worker-pd DMA DPSR:
@@ -168,7 +171,6 @@ decode-worker-pd DMA DPSR:
     {{DECODE_PD_VLLM_ARGS}} \
     --data-parallel-address {{DMA}} \
     --data-parallel-start-rank {{DPSR}} \
-    --data-parallel-size 8 \
     2>&1 | tee decode-worker-pd-{{DPSR}}.log
 
 wait PORT="8000":
@@ -201,10 +203,10 @@ bench BS="4096" RATE="inf" ISL="2048" OSL="1024" PORT="8192" COMMON_PREFIX="0":
 bench-prefill BS="1024" RATE="inf" ISL="2048" OSL="1" PORT="8000":
   just bench {{BS}} {{RATE}} {{ISL}} {{OSL}} {{PORT}}
 
-# Uses short input (2 tokens) to measure decode throughput
+# Uses short input (1 token) to measure decode throughput
 # Requires prefix len configuration on vllm bench serve side
 # Benchmark decode performance
-bench-decode BS="4096" RATE="inf" ISL="2" OSL="1024" PORT="8000" COMMON_PREFIX="2047":
+bench-decode BS="4096" RATE="inf" ISL="1" OSL="1024" PORT="8000" COMMON_PREFIX="2047":
   just bench {{BS}} {{RATE}} {{ISL}} {{OSL}} {{PORT}} {{COMMON_PREFIX}}
 
 eval PORT="8000":
