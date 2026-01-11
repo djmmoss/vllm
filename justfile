@@ -23,9 +23,7 @@ NCCL_NVLS_ENABLE=1 '''
 
 COMMON_VLLM_ENV := '''\
 VLLM_RANDOMIZE_DP_DUMMY_INPUTS=1 \
-VLLM_ATTENTION_BACKEND=FLASHINFER_MLA \
 VLLM_USE_FLASHINFER_MOE_FP4=1 \
-VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL=1 \
 VLLM_USE_NCCL_SYMM_MEM=1 '''
 
 
@@ -58,6 +56,8 @@ DECODE_PD_VLLM_ENV := DECODE_VLLM_ENV + PD_VLLM_ENV
 # ---------
 
 COMMON_VLLM_ARGS := '''
+--attention-config.backend FLASHINFER_MLA \
+--attention-config.use_trtllm_ragged_deepseek_prefill \
 --kv-cache-dtype fp8 \
 --tensor-parallel-size 1 \
 --pipeline-parallel-size 1 \
@@ -94,13 +94,14 @@ DECODE_VLLM_ARGS := COMMON_VLLM_ARGS + '''\
 --max-num-batched-tokens 2048 \
 --compilation_config.cudagraph_mode=FULL_DECODE_ONLY \
 --compilation_config.custom_ops+=+rms_norm,+rotary_embedding \
---data-parallel-size 16 \
+--data-parallel-size 32 \
 --no-enforce-eager \
 --enable-eplb \
---eplb-config '{"window_size":"100", "step_interval":"500", "num_redundant_experts":"16", "log_balancedness":"False"}' \
---cudagraph-capture-size ''' + BATCH
+--eplb-config '{"window_size":"100", "step_interval":"500", "num_redundant_experts":"32", "log_balancedness":"False"}' \
+--max-cudagraph-capture-size ''' + BATCH
 
-DECODE_PD_VLLM_ARGS := DECODE_VLLM_ARGS + PD_VLLM_ARGS
+DECODE_PD_VLLM_ARGS := DECODE_VLLM_ARGS
+#+ PD_VLLM_ARGS
 
 # ---
 # PD
@@ -174,7 +175,7 @@ decode-worker-pd DMA DPSR:
     {{DECODE_PD_VLLM_ARGS}} \
     --data-parallel-address {{DMA}} \
     --data-parallel-start-rank {{DPSR}} \
-    2>&1 | tee decode-worker-pd-{{DPSR}}.log
+    2>&1 | tee decode-worker-pd-{{DPSR}}-`hostname -i`.log
 
 wait PORT="8000":
   #!/usr/bin/env bash
@@ -215,13 +216,13 @@ bench-decode BS="4096" RATE="inf" ISL="1" OSL="1024" PORT="8000" COMMON_PREFIX="
 eval PORT="8000":
   just wait {{PORT}}
   lm_eval --model local-completions --tasks gsm8k \
-    --model_args model={{MODEL}},base_url=http://127.0.0.1:{{PORT}}/v1/completions,num_concurrent=32 \
+    --model_args model={{MODEL}},base_url=http://127.0.0.1:{{PORT}}/v1/completions,num_concurrent=100 \
     --limit 100
 
 eval-full PORT="8000":
   just wait
   lm_eval --model local-completions --tasks gsm8k \
-    --model_args model={{MODEL}},base_url=http://127.0.0.1:{{PORT}}/v1/completions,num_concurrent=256
+    --model_args model={{MODEL}},base_url=http://127.0.0.1:{{PORT}}/v1/completions,num_concurrent=1024
 
 download:
   HF_HOME={{HF_CACHE_HOME}} hf download {{MODEL}}
