@@ -3,7 +3,7 @@ HF_CACHE_HOME := "/data/numa0/ming_hf_cache/"
 export HF_HOME := HF_CACHE_HOME
 export FLASHINFER_CACHE_DIR := "/data/nfs01/ming/.cache/flashinfer/"
 PREC := "fp4"
-BATCH := "1536"
+BATCH := "1024"
 
 # ---
 # ENV
@@ -47,7 +47,7 @@ VLLM_MOE_DP_CHUNK_SIZE=1536 \
 VLLM_DEEPEPLL_NVFP4_DISPATCH=1 \
 VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING=0 \
 VLLM_V1_OUTPUT_PROC_CHUNK_SIZE=2048 \
-VLLM_FLASHINFER_MOE_BACKEND=masked_gemm '''
+VLLM_FLASHINFER_MOE_BACKEND=latency '''
 
 DECODE_PD_VLLM_ENV := DECODE_VLLM_ENV + PD_VLLM_ENV
 
@@ -56,8 +56,9 @@ DECODE_PD_VLLM_ENV := DECODE_VLLM_ENV + PD_VLLM_ENV
 # ---------
 
 COMMON_VLLM_ARGS := '''
+--profiler-config.torch_profiler_dir=./profile/ \
 --attention-config.backend FLASHINFER_MLA \
---attention-config.use_trtllm_ragged_deepseek_prefill \
+--attention-config.use_trtllm_ragged_deepseek_prefill=true \
 --kv-cache-dtype fp8 \
 --tensor-parallel-size 1 \
 --pipeline-parallel-size 1 \
@@ -85,23 +86,23 @@ PREFILL_VLLM_ARGS := COMMON_VLLM_ARGS + '''\
 
 PREFILL_PD_VLLM_ARGS := PREFILL_VLLM_ARGS + PD_VLLM_ARGS
 
+#--enable-eplb \
+#--eplb-config '{"window_size":"100", "step_interval":"500", "num_redundant_experts":"32", "log_balancedness":"False"}' \
+#--all2all-backend allgather_reducescatter deepep_low_latency\
 DECODE_VLLM_ARGS := COMMON_VLLM_ARGS + '''\
 --gpu-memory-utilization 0.82 \
---all2all-backend deepep_low_latency \
+--all2all-backend allgather_reducescatter \
 --data-parallel-hybrid-lb \
 --stream-interval 50 \
 --max-num-seqs ''' + BATCH + ''' \
 --max-num-batched-tokens 2048 \
 --compilation_config.cudagraph_mode=FULL_DECODE_ONLY \
 --compilation_config.custom_ops+=+rms_norm,+rotary_embedding \
---data-parallel-size 32 \
+--data-parallel-size 8 \
 --no-enforce-eager \
---enable-eplb \
---eplb-config '{"window_size":"100", "step_interval":"500", "num_redundant_experts":"32", "log_balancedness":"False"}' \
 --max-cudagraph-capture-size ''' + BATCH
 
-DECODE_PD_VLLM_ARGS := DECODE_VLLM_ARGS
-#+ PD_VLLM_ARGS
+DECODE_PD_VLLM_ARGS := DECODE_VLLM_ARGS + PD_VLLM_ARGS
 
 # ---
 # PD
@@ -110,7 +111,7 @@ DECODE_PD_VLLM_ARGS := DECODE_VLLM_ARGS
 PD_VLLM_ENV := ''' \
 VLLM_NIXL_SIDE_CHANNEL_HOST=`hostname -i` \
 VLLM_NIXL_SIDE_CHANNEL_PORT=5600 \
-VLLM_NIXL_ABORT_REQUEST_TIMEOUT=300 '''
+VLLM_NIXL_ABORT_REQUEST_TIMEOUT=600 '''
 
 PD_VLLM_ARGS := ''' \
 --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both", "kv_load_failure_policy":"fail"}' '''
@@ -136,7 +137,7 @@ nsys profile \
 
 #{{PREFILL_PD_VLLM_ENV}} {{NSYS_COMMAND}} -o ds-{{PREC}}-prefill-master.nsys-rep vllm serve {{MODEL}} \
 prefill-master-pd PMA DPS:
-  {{PREFILL_PD_VLLM_ENV}} VLLM_TORCH_PROFILER_DIR=./profile/ \
+  {{PREFILL_PD_VLLM_ENV}} \
     vllm serve {{MODEL}} \
     {{PREFILL_PD_VLLM_ARGS}} \
     --data-parallel-address {{PMA}} \
@@ -145,7 +146,7 @@ prefill-master-pd PMA DPS:
 
 #{{PREFILL_PD_VLLM_ENV}} {{NSYS_COMMAND}} -o ds-{{PREC}}-prefill-master.nsys-rep \
 prefill-off PMA DPS NUMA="0" :
-  {{PREFILL_PD_VLLM_ENV}} VLLM_TORCH_PROFILER_DIR=./profile/ \
+  {{PREFILL_PD_VLLM_ENV}} \
     numactl --cpunodebind={{NUMA}} --membind={{NUMA}} \
     vllm serve {{MODEL}} \
     {{PREFILL_PD_VLLM_ARGS}} \
@@ -162,7 +163,6 @@ prefill-off PMA DPS NUMA="0" :
 #{{DECODE_PD_VLLM_ENV}} {{NSYS_COMMAND}} -o ds-{{PREC}}-decode-worker-{{DPSR}}.nsys-rep \
 decode-master-pd DMA:
     {{DECODE_PD_VLLM_ENV}} \
-    VLLM_TORCH_PROFILER_DIR=./profile/ \
     vllm serve {{MODEL}} \
     {{DECODE_PD_VLLM_ARGS}} \
     --data-parallel-address {{DMA}} \
@@ -170,7 +170,6 @@ decode-master-pd DMA:
 
 decode-worker-pd DMA DPSR:
     {{DECODE_PD_VLLM_ENV}} \
-    VLLM_TORCH_PROFILER_DIR=./profile/ \
     vllm serve {{MODEL}} \
     {{DECODE_PD_VLLM_ARGS}} \
     --data-parallel-address {{DMA}} \
@@ -201,6 +200,26 @@ bench BS="4096" RATE="inf" ISL="2048" OSL="1024" PORT="8192" COMMON_PREFIX="0":
     --request-rate {{RATE}} \
     --seed $RANDOM \
     --trust_remote_code
+
+
+realbench BS="4096" RATE="inf" ISL="2048" OSL="1024" PORT="8192" COMMON_PREFIX="0":
+    #!/usr/bin/env bash
+    just wait {{PORT}}
+    vllm bench serve \
+        --sharegpt-prefix-len {{COMMON_PREFIX}} \
+        --dataset-name sharegpt \
+        --dataset-path ./ShareGPT_V3_unfiltered_cleaned_split.json \
+        --ignore-eos \
+        --max-concurrency {{BS}} \
+        --model {{MODEL}} \
+        --num-prompts {{BS}} \
+        --port {{PORT}} \
+        --sharegpt-suffix-len {{ISL}} \
+        --sharegpt-output-len {{OSL}} \
+        --ready-check-timeout-sec 0 \
+        --request-rate {{RATE}} \
+        --seed $RANDOM \
+        --trust_remote_code
 
 # Uses short output (1 token) to measure prefill throughput
 # Benchmark prefill performance
