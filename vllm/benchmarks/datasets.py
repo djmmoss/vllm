@@ -1308,26 +1308,32 @@ class ShareGPTDataset(BenchmarkDataset):
         )
         return samples
 
-    def _build_token_pool(self, tokenizer: TokenizerLike) -> list[int]:
+    def _build_token_pool(self, tokenizer: TokenizerLike, min_tokens: int) -> list[int]:
         """
-        Concatenate all conversation text and tokenize to create a large pool
-        of real ShareGPT tokens.
+        Tokenize conversation prompts until we have enough tokens.
+
+        Stops early once min_tokens is reached to avoid tokenizing
+        the entire dataset.
+
+        Args:
+            tokenizer: Tokenizer to use for encoding.
+            min_tokens: Minimum number of tokens needed.
 
         Returns:
-            list[int]: A list of token IDs from all conversations.
+            list[int]: A list of token IDs from conversations.
         """
-        all_text = []
+        token_ids: list[int] = []
         for entry in self.data:
+            if len(token_ids) >= min_tokens:
+                break
             for conv in entry.get("conversations", []):
+                if len(token_ids) >= min_tokens:
+                    break
                 value = conv.get("value", "")
                 if value:
-                    all_text.append(value)
-
-        # Join with spaces to avoid word boundary issues
-        combined_text = " ".join(all_text)
-
-        # Tokenize the combined text
-        token_ids = tokenizer.encode(combined_text, add_special_tokens=False)
+                    # Tokenize this conversation and append
+                    conv_tokens = tokenizer.encode(value, add_special_tokens=False)
+                    token_ids.extend(conv_tokens)
 
         return token_ids
 
@@ -1439,8 +1445,11 @@ class ShareGPTDataset(BenchmarkDataset):
         if output_len is None:
             output_len = 128  # Default output length for prefix mode
 
-        # Build token pool from all conversations
-        token_pool = self._build_token_pool(tokenizer)
+        # Calculate minimum tokens needed: prefix + enough for all unique suffixes
+        min_tokens_needed = prefix_len + (num_requests * suffix_len)
+
+        # Build token pool (stops early once we have enough tokens)
+        token_pool = self._build_token_pool(tokenizer, min_tokens_needed)
 
         logger.info(
             "Built token pool with %d tokens from ShareGPT data",
