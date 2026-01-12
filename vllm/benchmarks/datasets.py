@@ -1244,8 +1244,23 @@ class ShareGPTDataset(BenchmarkDataset):
         enable_multimodal_chat: bool = False,
         request_id_prefix: str = "",
         no_oversample: bool = False,
+        prefix_len: int | None = None,
+        suffix_len: int = 1,
         **kwargs,
     ) -> list:
+        # If prefix mode is enabled, use the prefix sampling method
+        if prefix_len is not None:
+            return self._sample_with_prefix(
+                tokenizer=tokenizer,
+                num_requests=num_requests,
+                prefix_len=prefix_len,
+                suffix_len=suffix_len,
+                output_len=output_len,
+                request_id_prefix=request_id_prefix,
+                no_oversample=no_oversample,
+            )
+
+        # Standard ShareGPT sampling (unchanged)
         samples: list = []
         ind = 0
         for entry in self.data:
@@ -1292,6 +1307,226 @@ class ShareGPTDataset(BenchmarkDataset):
             samples, num_requests, request_id_prefix, no_oversample
         )
         return samples
+
+    def _build_token_pool(self, tokenizer: TokenizerLike) -> list[int]:
+        """
+        Concatenate all conversation text and tokenize to create a large pool
+        of real ShareGPT tokens.
+
+        Returns:
+            list[int]: A list of token IDs from all conversations.
+        """
+        all_text = []
+        for entry in self.data:
+            for conv in entry.get("conversations", []):
+                value = conv.get("value", "")
+                if value:
+                    all_text.append(value)
+
+        # Join with spaces to avoid word boundary issues
+        combined_text = " ".join(all_text)
+
+        # Tokenize the combined text
+        token_ids = tokenizer.encode(combined_text, add_special_tokens=False)
+
+        return token_ids
+
+    def _get_prefix_from_pool(
+        self,
+        token_pool: list[int],
+        prefix_len: int,
+    ) -> list[int]:
+        """
+        Extract the first N tokens from the token pool as the common prefix.
+
+        Args:
+            token_pool: The full token pool from all conversations.
+            prefix_len: Number of tokens for the prefix.
+
+        Returns:
+            list[int]: The prefix token IDs.
+
+        Raises:
+            ValueError: If token pool is smaller than required prefix length.
+        """
+        if len(token_pool) < prefix_len:
+            raise ValueError(
+                f"Token pool size ({len(token_pool)}) is smaller than "
+                f"required prefix length ({prefix_len}). "
+                "Load more ShareGPT data or reduce --sharegpt-prefix-len."
+            )
+
+        return token_pool[:prefix_len]
+
+    def _get_suffix_from_pool(
+        self,
+        token_pool: list[int],
+        prefix_len: int,
+        suffix_len: int,
+        index: int,
+    ) -> list[int]:
+        """
+        Extract a unique suffix from the token pool for each request.
+
+        Uses different starting positions in the pool to ensure each request
+        has a different suffix while using real ShareGPT tokens.
+
+        Args:
+            token_pool: The full token pool from all conversations.
+            prefix_len: Number of tokens used for prefix (to skip).
+            suffix_len: Number of tokens for this suffix.
+            index: Request index (used to determine starting position).
+
+        Returns:
+            list[int]: The suffix token IDs.
+        """
+        # Calculate available tokens after prefix
+        available_start = prefix_len
+        available_tokens = len(token_pool) - available_start
+
+        if available_tokens < suffix_len:
+            raise ValueError(
+                f"Not enough tokens in pool for suffix. "
+                f"Available: {available_tokens}, Required: {suffix_len}. "
+                "Load more ShareGPT data or reduce suffix/prefix lengths."
+            )
+
+        # Use modulo to wrap around if we have many requests
+        # Each request starts at a different position
+        start_pos = available_start + (index * suffix_len) % available_tokens
+
+        # Handle wrap-around
+        if start_pos + suffix_len <= len(token_pool):
+            return token_pool[start_pos : start_pos + suffix_len]
+        else:
+            # Wrap around to beginning of available region
+            end_in_pool = start_pos + suffix_len - len(token_pool)
+            return (
+                token_pool[start_pos:]
+                + token_pool[available_start : available_start + end_in_pool]
+            )
+
+    def _sample_with_prefix(
+        self,
+        tokenizer: TokenizerLike,
+        num_requests: int,
+        prefix_len: int,
+        suffix_len: int,
+        output_len: int | None,
+        request_id_prefix: str = "",
+        no_oversample: bool = False,
+    ) -> list[SampleRequest]:
+        """
+        Sample requests with a common prefix extracted from real ShareGPT data.
+
+        This mode is designed for:
+        - EPLB benchmarking with realistic expert routing patterns
+        - Prefix caching / decode-only measurement
+
+        Args:
+            tokenizer: Tokenizer to use for encoding/decoding.
+            num_requests: Number of requests to generate.
+            prefix_len: Number of tokens for the common prefix.
+            suffix_len: Number of unique tokens per request after prefix.
+            output_len: Expected output length for each request.
+            request_id_prefix: Prefix for request IDs.
+            no_oversample: If True, don't oversample if fewer samples available.
+
+        Returns:
+            list[SampleRequest]: Generated sample requests.
+        """
+        # Set default output length
+        if output_len is None:
+            output_len = 128  # Default output length for prefix mode
+
+        # Build token pool from all conversations
+        token_pool = self._build_token_pool(tokenizer)
+
+        logger.info(
+            "Built token pool with %d tokens from ShareGPT data",
+            len(token_pool),
+        )
+
+        # Validate we have enough tokens
+        min_required = prefix_len + suffix_len
+        if len(token_pool) < min_required:
+            raise ValueError(
+                f"Token pool ({len(token_pool)} tokens) is too small. "
+                f"Need at least {min_required} tokens "
+                f"(prefix_len={prefix_len} + suffix_len={suffix_len}). "
+                "Load more ShareGPT data or reduce lengths."
+            )
+
+        # Extract common prefix
+        prefix_tokens = self._get_prefix_from_pool(token_pool, prefix_len)
+
+        # Use gen_prompt_decode_to_target_len to ensure exact prefix length
+        prefix_prompt, adjusted_prefix_tokens, prefix_mismatch = (
+            gen_prompt_decode_to_target_len(
+                tokenizer=tokenizer,
+                token_sequence=prefix_tokens,
+                target_token_len=prefix_len,
+                add_special_tokens=False,
+            )
+        )
+
+        if prefix_mismatch != 0:
+            logger.warning(
+                "Prefix token count adjusted by %d tokens after decode/re-encode",
+                prefix_mismatch,
+            )
+
+        # Generate requests
+        requests: list[SampleRequest] = []
+        token_mismatch_total = 0
+
+        for i in range(num_requests):
+            # Get unique suffix for this request
+            suffix_tokens = self._get_suffix_from_pool(
+                token_pool=token_pool,
+                prefix_len=prefix_len,
+                suffix_len=suffix_len,
+                index=i,
+            )
+
+            # Combine prefix and suffix
+            combined_tokens = list(adjusted_prefix_tokens) + suffix_tokens
+
+            # Ensure exact length after decode/re-encode
+            target_len = len(adjusted_prefix_tokens) + suffix_len
+            prompt, final_tokens, mismatch = gen_prompt_decode_to_target_len(
+                tokenizer=tokenizer,
+                token_sequence=combined_tokens,
+                target_token_len=target_len,
+                add_special_tokens=False,
+            )
+            token_mismatch_total += mismatch
+
+            prompt_len = len(final_tokens)
+
+            requests.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=prompt_len,
+                    expected_output_len=output_len,
+                    request_id=request_id_prefix + str(i),
+                )
+            )
+
+        if token_mismatch_total != 0:
+            sign = "more" if token_mismatch_total > 0 else "fewer"
+            logger.warning(
+                "Across all generated prompts, there were %d %s tokens "
+                "than expected after decoding and re-encoding.",
+                abs(token_mismatch_total),
+                sign,
+            )
+
+        self.maybe_oversample_requests(
+            requests, num_requests, request_id_prefix, no_oversample
+        )
+
+        return requests
 
 
 class _ValidateDatasetArgs(argparse.Action):
@@ -1420,6 +1655,22 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         default=None,
         help="Output length for each request. Overrides the output length "
         "from the ShareGPT dataset.",
+    )
+    sharegpt_group.add_argument(
+        "--sharegpt-prefix-len",
+        type=int,
+        default=None,
+        help="Number of common prefix tokens for all requests. "
+        "When specified, enables prefix mode: a common prefix is extracted "
+        "from concatenated ShareGPT conversations, followed by unique suffixes. "
+        "If None (default), standard ShareGPT sampling is used.",
+    )
+    sharegpt_group.add_argument(
+        "--sharegpt-suffix-len",
+        type=int,
+        default=1,
+        help="Number of unique suffix tokens per request after the common prefix. "
+        "Only used when --sharegpt-prefix-len is specified. Default: 1.",
     )
 
     blazedit_group = parser.add_argument_group("blazedit dataset options")
@@ -1861,6 +2112,8 @@ def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
                 output_len=args.sharegpt_output_len,
                 request_id_prefix=args.request_id_prefix,
                 no_oversample=args.no_oversample,
+                prefix_len=args.sharegpt_prefix_len,
+                suffix_len=args.sharegpt_suffix_len,
             ),
             "burstgpt": lambda: BurstGPTDataset(
                 random_seed=args.seed,
