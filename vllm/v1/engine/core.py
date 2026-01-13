@@ -185,7 +185,7 @@ class EngineCore:
         else:
             self._start_perf_iter = -1
             self._stop_perf_iter = -1
-        logger.info(f"Profiler START-STOP: {self._start_perf_iter}-{self._stop_perf_iter}")
+        logger.info(f"Profiler START-STOP: {self._start_perf_iter}-{self._stop_perf_iter}, max_num_seqs: {self.max_num_seqs}")
 
         # Setup batch queue for pipeline parallelism.
         # Batch queue for scheduled batches. This enables us to asynchronously
