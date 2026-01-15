@@ -320,6 +320,9 @@ RUN --mount=type=bind,source=.git,target=.git \
 ARG vllm_target_device="cuda"
 ENV VLLM_TARGET_DEVICE=${vllm_target_device}
 
+ARG VLLM_VERSION_OVERRIDE
+ENV VLLM_VERSION_OVERRIDE=${VLLM_VERSION_OVERRIDE}
+
 # Skip adding +precompiled suffix to version (preserves git-derived version)
 ENV VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX=1
 
