@@ -143,7 +143,6 @@ bench PMA="" PORT="8087" MC="8096" ISL="1024" OSL="1024" COMMON_PREFIX="0" SKIP_
 		--random-output-len {{OSL}} \
 		--ready-check-timeout-sec 0 \
 		--common-prefix-len {{COMMON_PREFIX}} \
-		--num-skip-requests {{SKIP_REQS}} \
 		2>&1 | tee bench.log
 
 accuracy MA="" PORT="8087":
