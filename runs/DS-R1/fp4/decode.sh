@@ -1,5 +1,12 @@
 #!/bin/bash
 
+# User-specific paths
+export USER_LUSTRE_DIR="/mnt/lustre/$USER"
+export ENROOT_CONFIG_PATH="$USER_LUSTRE_DIR/.config/enroot"
+export CONTAINER_IMAGE="$USER_LUSTRE_DIR/images/minosfuture+vllm-openai+aarch64-7434b20cf.sqsh"
+export MODEL_DIR="$USER_LUSTRE_DIR/models"
+export VLLM_DIR="$USER_LUSTRE_DIR/vllm"
+
 echo $SLURM_JOB_NUM_NODES nodes allocated
 if [ "$SLURM_JOB_NUM_NODES" -le 0 ]; then
     echo "Error: This script requires at least 1 node, but only $SLURM_JOB_NUM_NODES node(s) allocated"
@@ -22,8 +29,8 @@ DPS="$((SLURM_JOB_NUM_NODES * 4))"
 srun --segment $SLURM_JOB_NUM_NODES --ntasks-per-node=1 sudo nvidia-smi -ac 3996,2062
 
 srun --segment $SLURM_JOB_NUM_NODES \
-	--container-image=/lustre/fsw/coreai_devtech_all/jiahanc/meta-dsr1-gb200/images/vllm-custom.sqsh \
-	--container-mounts=/lustre/fsw/coreai_devtech_all/jiahanc/meta-dsr1-gb200:/scratch,/lustre/fsw/coreai_devtech_all/siyuanf/models:/ds-models \
+	--container-image="$CONTAINER_IMAGE" \
+	--container-mounts="$VLLM_DIR:/scratch,$MODEL_DIR:/ds-models" \
 	--container-workdir=/scratch/runs/DS-R1/fp4 \
 	--mpi=pmix \
 	bash -c "

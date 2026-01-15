@@ -1,6 +1,13 @@
 # Fixed configuration: 2 prefill (TP=8 each, hybrid-lb) + 1 decode (TP=8, hybrid-lb)
 # Total: 7 nodes (4 prefill + 2 decode + 1 router)
 
+# User-specific paths
+export USER_LUSTRE_DIR="/mnt/lustre/$USER"
+export ENROOT_CONFIG_PATH="$USER_LUSTRE_DIR/.config/enroot"
+export CONTAINER_IMAGE="$USER_LUSTRE_DIR/images/minosfuture+vllm-openai+aarch64-7434b20cf.sqsh"
+export MODEL_DIR="$USER_LUSTRE_DIR/models"
+export VLLM_DIR="$USER_LUSTRE_DIR/vllm"
+
 echo $SLURM_JOB_NUM_NODES nodes allocated
 if [ "$SLURM_JOB_NUM_NODES" -lt 7 ]; then
     echo "Error: This script requires 7 nodes, but only $SLURM_JOB_NUM_NODES node(s) allocated"
@@ -48,8 +55,8 @@ ALL_NODE_NUMS_STR="${ALL_NODE_NUMS[*]}"
 srun --segment $SLURM_JOB_NUM_NODES --ntasks-per-node=1 sudo nvidia-smi -ac 3996,2062
 
 srun --segment $SLURM_JOB_NUM_NODES \
-    --container-image=/lustre/fsw/coreai_devtech_all/jiahanc/meta-dsr1-gb200/images/vllm-custom.sqsh \
-    --container-mounts=/lustre/fsw/coreai_devtech_all/jiahanc/meta-dsr1-gb200:/scratch,/lustre:/lustre \
+    --container-image="$CONTAINER_IMAGE" \
+    --container-mounts="$VLLM_DIR:/scratch,$MODEL_DIR:/ds-models" \
     --container-workdir=/scratch/runs/Kimi-K2/fp4 \
     --mpi=pmix \
     bash -c "
