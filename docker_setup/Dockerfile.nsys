@@ -21,10 +21,11 @@ RUN uv pip install --system --no-deps --no-build-isolation flashinfer_python==v0
 RUN uv pip uninstall --system nvidia-nvshmem-cu13
 RUN uv pip uninstall --system nvidia-nvshmem-cu12
 RUN uv pip install --system nixl nvidia-nvshmem-cu${CUDA_MAJOR_VERSION}==3.4.5 pandas datasets nvtx lm_eval[api]
+RUN uv pip install --system torch==2.9.1+cu129 --index-url https://download.pytorch.org/whl/cu129
 
 RUN sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libssl-dev protobuf-compiler git
 
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN git clone https://github.com/vllm-project/router.git --depth 1 && cd router && cargo build --release
+RUN git clone https://github.com/minosfuture/router.git --branch queue_size --depth 1 && cd router && cargo build --release
 ENV TRITON_PTXAS_PATH /usr/local/cuda/bin/ptxas
