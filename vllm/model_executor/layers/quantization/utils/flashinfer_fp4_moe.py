@@ -96,9 +96,12 @@ def build_flashinfer_fp4_trtllm_moe_prepare_finalize(
     """
     use_dp = moe.moe_parallel_config.dp_size > 1
     enable_alltoallv = moe.moe_parallel_config.all2all_backend == "flashinfer_all2allv"
+    enable_moe_a2a = moe.moe_parallel_config.all2all_backend == "flashinfer_moe_a2a"
     return create_flashinfer_trtllm_prepare_finalize(
         use_dp=use_dp,
         enable_alltoallv=enable_alltoallv,
+        enable_moe_a2a=enable_moe_a2a,
+        moe=moe,
     )
 
 
