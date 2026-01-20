@@ -13,9 +13,9 @@ RUN curl -L -O https://github.com/casey/just/releases/download/1.43.1/just-1.43.
 
 # Install flashinfer 0.6.0rc2
 RUN uv pip uninstall --system flashinfer_python flashinfer-cubin flashinfer-jit-cache
-RUN uv pip install --system --no-deps --no-build-isolation flashinfer_python==v0.6.0rc2 \
-    https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.0rc2/flashinfer_cubin-0.6.0rc2-py3-none-any.whl \
-    https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.0rc2/flashinfer_jit_cache-0.6.0rc2+cu129-cp39-abi3-manylinux_2_28_aarch64.whl
+RUN uv pip install --system --no-deps --no-build-isolation flashinfer_python==v0.6.1 \
+    https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.1/flashinfer_cubin-0.6.1-py3-none-any.whl \
+    https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.1/flashinfer_jit_cache-0.6.1+cu129-cp39-abi3-manylinux_2_28_aarch64.whl
 
 
 RUN uv pip uninstall --system nvidia-nvshmem-cu13
