@@ -56,6 +56,7 @@ class FlashInferTRTLLMAllToAllMoEPrepareAndFinalize(
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         num_experts: int,
+        local_num_experts: int,
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
@@ -136,6 +137,7 @@ class FlashInferTRTLLMAllGatherMoEPrepareAndFinalize(
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         num_experts: int,
+        local_num_experts: int,
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
@@ -295,7 +297,7 @@ def flashinfer_alltoall_combine(
         token_count=token_count,
     )
 
-class FlashInferMoeA2APrepareAndFinalize(FlashInferTRTLLMAllToAllMoEPrepareAndFinalize):
+class FlashInferMoeA2APrepareAndFinalize(FlashInferCutlassMoEPrepareAndFinalize):
     """FlashInfer implementation using the Moe AlltoAll kernel."""
 
     def __init__(
@@ -325,6 +327,7 @@ class FlashInferMoeA2APrepareAndFinalize(FlashInferTRTLLMAllToAllMoEPrepareAndFi
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         num_experts: int,
+        local_num_experts: int,
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
