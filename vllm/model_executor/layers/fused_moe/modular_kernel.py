@@ -921,6 +921,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         The _prepare method is a wrapper around self.prepare_finalize.prepare
         that handles DBO and async.
         """
+        w2_gemm_overlap_args = None
         if not self.prepare_finalize.supports_async():
             # We shouldn't be running an a2a kernel that doesn't
             # support async prepare/finalize

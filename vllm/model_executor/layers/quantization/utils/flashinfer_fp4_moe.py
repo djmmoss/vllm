@@ -354,6 +354,7 @@ class FlashInferTRTLLMFP4Experts(mk.FusedMoEPermuteExpertsUnpermute):
         workspace2: torch.Tensor | None,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
+        w2_gemm_overlap_args,
     ):
         import flashinfer
 
