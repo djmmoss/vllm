@@ -49,6 +49,15 @@ from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models import SupportsMultiModal
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalDataDict, MultiModalUUIDDict
+from vllm.multimodal.inputs import (
+    MultiModalBatchedField,
+    MultiModalFlatField,
+    MultiModalSharedField,
+    VisionChunk,
+    VisionChunkImage,
+    VisionChunkVideo,
+)
+from vllm.multimodal.processing import BaseMultiModalProcessor
 from vllm.multimodal.utils import MEDIA_CONNECTOR_REGISTRY, MediaConnector
 from vllm.tokenizers import TokenizerLike
 from vllm.transformers_utils.chat_templates import get_chat_template_fallback_path
@@ -641,7 +650,9 @@ def resolve_chat_template_content_format(
     return detected_format
 
 
-ModalityStr = Literal["image", "audio", "video", "image_embeds", "audio_embeds"]
+ModalityStr = Literal[
+    "image", "audio", "video", "image_embeds", "audio_embeds", "vision_chunk"
+]
 _T = TypeVar("_T")
 
 
@@ -683,6 +694,78 @@ def _get_embeds_data(items_by_modality: dict[str, list[Any]], modality: str):
     return embeds
 
 
+def rebuild_mm_uuids_from_mm_data(
+    mm_uuids: MultiModalUUIDDict,
+    mm_data: MultiModalDataDict,
+) -> MultiModalUUIDDict:
+    """Rebuild mm_uuids after vision_chunk processing.
+
+    When videos are split into chunks, the original UUIDs need to be updated
+    to reflect the new UUIDs generated for each chunk.
+
+    Args:
+        mm_uuids: Original UUIDs dictionary
+        mm_data: Processed multimodal data with vision_chunk items
+
+    Returns:
+        Updated UUIDs dictionary with chunk UUIDs
+    """
+    vision_chunks = mm_data.get("vision_chunk")
+    if vision_chunks is None:
+        return mm_uuids
+
+    new_uuids = dict(mm_uuids)
+    vision_chunk_uuids = []
+
+    for item in vision_chunks:
+        # vision_chunk items are always dicts (VisionChunkImage/VisionChunkVideo)
+        assert isinstance(item, dict)
+        uuid_val = item.get("uuid")
+        if uuid_val is not None:
+            vision_chunk_uuids.append(uuid_val)
+
+    if vision_chunk_uuids:
+        new_uuids["vision_chunk"] = vision_chunk_uuids
+
+    return new_uuids
+
+
+def build_video_prompts_from_mm_data(
+    mm_data: MultiModalDataDict,
+) -> list[str]:
+    """Build video prompts from vision_chunk data.
+
+    Collects prompts from video chunks and groups them by video_idx.
+
+    Args:
+        mm_data: Processed multimodal data with vision_chunk items
+
+    Returns:
+        List of video prompts, one per video.
+    """
+    vision_chunks = mm_data.get("vision_chunk")
+    if vision_chunks is None:
+        return []
+
+    # Group chunks by video_idx
+    video_prompts_dict: dict[int, list[str]] = defaultdict(list)
+
+    for item in vision_chunks:
+        # vision_chunk items are always dicts (VisionChunkImage/VisionChunkVideo)
+        assert isinstance(item, dict)
+        if item.get("type") == "video_chunk":
+            video_idx = item.get("video_idx", 0)
+            prompt = item.get("prompt", "")
+            video_prompts_dict[video_idx].append(prompt)
+
+    # Build prompts in video order
+    video_prompts = []
+    for video_idx in sorted(video_prompts_dict.keys()):
+        video_prompts.append("".join(video_prompts_dict[video_idx]))
+
+    return video_prompts
+
+
 class BaseMultiModalItemTracker(ABC, Generic[_T]):
     """
     Tracks multi-modal items in a given request and ensures that the number
@@ -697,6 +780,13 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
 
         self._items_by_modality = defaultdict[str, list[_T | None]](list)
         self._uuids_by_modality = defaultdict[str, list[str | None]](list)
+        # Track original modality for each vision_chunk item (image or video)
+        self._modality_order = defaultdict[str, list[str]](list)
+
+    @cached_property
+    def use_unified_vision_chunk_modality(self) -> bool:
+        """Check if model uses unified vision_chunk modality for images/videos."""
+        return getattr(self._model_config.hf_config, "use_unified_vision_chunk", False)
 
     @property
     def model_config(self) -> ModelConfig:
@@ -739,12 +829,33 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
         media.
         """
         input_modality = modality.replace("_embeds", "")
-        num_items = len(self._items_by_modality[modality]) + 1
+        original_modality = modality
+        use_vision_chunk = (
+            self.use_unified_vision_chunk_modality
+            and original_modality in ["video", "image"]
+        )
+
+        # If use_unified_vision_chunk_modality is enabled,
+        # map image/video to vision_chunk
+        if use_vision_chunk:
+            # To avoid validation fail
+            # because models with use_unified_vision_chunk_modality=True
+            # will only accept vision_chunk modality.
+            input_modality = "vision_chunk"
+            num_items = len(self._items_by_modality[input_modality]) + 1
+        else:
+            num_items = len(self._items_by_modality[original_modality]) + 1
 
         self.mm_processor.validate_num_items(input_modality, num_items)
 
-        self._items_by_modality[modality].append(item)
-        self._uuids_by_modality[modality].append(uuid)
+        # Track original modality for vision_chunk items
+        if use_vision_chunk:
+            self._items_by_modality[input_modality].append(item)  # type: ignore
+            self._uuids_by_modality[input_modality].append(uuid)
+            self._modality_order["vision_chunk"].append(original_modality)
+        else:
+            self._items_by_modality[original_modality].append(item)
+            self._uuids_by_modality[original_modality].append(uuid)
 
         return self.model_cls.get_placeholder_str(modality, num_items)
 
@@ -799,6 +910,58 @@ class MultiModalItemTracker(BaseMultiModalItemTracker[object]):
             mm_inputs["audio"] = items_by_modality["audio"]  # A list of audios
         if "video" in items_by_modality:
             mm_inputs["video"] = items_by_modality["video"]  # A list of videos
+        if "vision_chunk" in items_by_modality:
+            # Process vision_chunk items for Kimi K2.5
+            vision_chunk_items = items_by_modality["vision_chunk"]
+            modality_order = self._modality_order.get("vision_chunk", [])
+            uuids = self._uuids_by_modality.get("vision_chunk", [])
+
+            # Filter out None items
+            filtered_items = [
+                (idx, item)
+                for idx, item in enumerate(vision_chunk_items)
+                if item is not None
+            ]
+
+            processed_chunks: list[VisionChunk] = []
+            video_idx = 0
+            for i, (idx, item) in enumerate(filtered_items):
+                inner_modality = modality_order[i] if i < len(modality_order) else "image"
+                uuid_val = uuids[idx] if idx < len(uuids) else None
+                if inner_modality == "image":
+                    if hasattr(item, "media"):
+                        image_data = item.media  # type: ignore[union-attr]
+                        processed_chunks.append(
+                            VisionChunkImage(type="image", image=image_data, uuid=uuid_val)
+                        )
+                    else:
+                        processed_chunks.append(item)  # type: ignore[arg-type]
+                elif inner_modality == "video":
+                    if hasattr(self.mm_processor, "split_video_chunks") and item is not None:
+                        try:
+                            video_uuid = uuid_val or random_uuid()
+                            if isinstance(item, tuple) and len(item) >= 1:
+                                video_data = item[0]
+                            else:
+                                video_data = item
+                            video_chunks = self.mm_processor.split_video_chunks(video_data)
+                            for j, vc in enumerate(video_chunks):
+                                processed_chunks.append(
+                                    VisionChunkVideo(
+                                        type="video_chunk",
+                                        video_chunk=vc["video_chunk"],
+                                        uuid=f"{video_uuid}-{j}",
+                                        video_idx=video_idx,
+                                        prompt=vc["prompt"],
+                                    )
+                                )
+                            video_idx += 1
+                        except Exception as e:
+                            logger.warning("Failed to split video chunks: %s", e)
+                            processed_chunks.append(item)  # type: ignore[arg-type]
+                    else:
+                        processed_chunks.append(item)  # type: ignore[arg-type]
+            mm_inputs["vision_chunk"] = processed_chunks
 
         return mm_inputs
 
@@ -835,6 +998,58 @@ class AsyncMultiModalItemTracker(BaseMultiModalItemTracker[Awaitable[object]]):
             mm_inputs["audio"] = items_by_modality["audio"]  # A list of audios
         if "video" in items_by_modality:
             mm_inputs["video"] = items_by_modality["video"]  # A list of videos
+        if "vision_chunk" in items_by_modality:
+            # Process vision_chunk items for Kimi K2.5 (async version)
+            vision_chunk_items = items_by_modality["vision_chunk"]
+            modality_order = self._modality_order.get("vision_chunk", [])
+            uuids = self._uuids_by_modality.get("vision_chunk", [])
+
+            # Filter out None items
+            filtered_items = [
+                (idx, item)
+                for idx, item in enumerate(vision_chunk_items)
+                if item is not None
+            ]
+
+            processed_chunks: list[VisionChunk] = []
+            video_idx = 0
+            for i, (idx, item) in enumerate(filtered_items):
+                inner_modality = modality_order[i] if i < len(modality_order) else "image"
+                uuid_val = uuids[idx] if idx < len(uuids) else None
+                if inner_modality == "image":
+                    if hasattr(item, "media"):
+                        image_data = item.media  # type: ignore[union-attr]
+                        processed_chunks.append(
+                            VisionChunkImage(type="image", image=image_data, uuid=uuid_val)
+                        )
+                    else:
+                        processed_chunks.append(item)  # type: ignore[arg-type]
+                elif inner_modality == "video":
+                    if hasattr(self.mm_processor, "split_video_chunks") and item is not None:
+                        try:
+                            video_uuid = uuid_val or random_uuid()
+                            if isinstance(item, tuple) and len(item) >= 1:
+                                video_data = item[0]
+                            else:
+                                video_data = item
+                            video_chunks = self.mm_processor.split_video_chunks(video_data)
+                            for j, vc in enumerate(video_chunks):
+                                processed_chunks.append(
+                                    VisionChunkVideo(
+                                        type="video_chunk",
+                                        video_chunk=vc["video_chunk"],
+                                        uuid=f"{video_uuid}-{j}",
+                                        video_idx=video_idx,
+                                        prompt=vc["prompt"],
+                                    )
+                                )
+                            video_idx += 1
+                        except Exception as e:
+                            logger.warning("Failed to split video chunks: %s", e)
+                            processed_chunks.append(item)  # type: ignore[arg-type]
+                    else:
+                        processed_chunks.append(item)  # type: ignore[arg-type]
+            mm_inputs["vision_chunk"] = processed_chunks
 
         return mm_inputs
 
