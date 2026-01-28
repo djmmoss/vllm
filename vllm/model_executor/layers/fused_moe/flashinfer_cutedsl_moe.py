@@ -367,6 +367,10 @@ def flashinfer_cutedsl_moe_fp4(
     expert_map: torch.Tensor | None = None,
     apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
+    # Handle tuple input from DP mode with post-quant allgather
+    if isinstance(hidden_states, tuple):
+        hidden_states, _ = hidden_states
+
     from vllm.model_executor.layers.fused_moe.flashinfer_cutlass_prepare_finalize import (  # noqa: E501
         create_flashinfer_prepare_finalize,
     )
