@@ -241,15 +241,16 @@ def flashinfer_cutlass_moe_fp4(
     apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
     # Handle tuple input from DP mode with post-quant allgather
-    if isinstance(hidden_states, tuple):
+    use_dp = isinstance(hidden_states, tuple)
+    if use_dp:
         hidden_states, _ = hidden_states
 
     fused_experts = mk.FusedMoEModularKernel(
-        create_flashinfer_prepare_finalize(use_dp=False),
+        create_flashinfer_prepare_finalize(use_dp=use_dp),
         FlashInferExperts(
             out_dtype=hidden_states.dtype,
             quant_config=quant_config,
-            use_dp=False,
+            use_dp=use_dp,
         ),
     )
 
