@@ -187,13 +187,12 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         assert self.rotary_emb is not None, (
             "rotary_emb must be set for fused RoPE+quant"
         )
-        L = ql_nope.shape[-1]
         attn_dtype = torch.float8_e4m3fn
 
-        # Output tensors - k_nope and k_pe are 2D for MLA
-        q_out = q_pe.new_empty(
-            q_pe.shape[0], q_pe.shape[1], L + q_pe.shape[2], dtype=attn_dtype
-        )
+        # Output tensors - FlashInfer kernel writes rope and nope parts separately
+        # We need separate output tensors, not slices of the same tensor
+        q_nope_fp8 = ql_nope.new_empty(ql_nope.shape, dtype=attn_dtype)
+        q_pe_fp8 = q_pe.new_empty(q_pe.shape, dtype=attn_dtype)
         k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
         k_pe_out = k_pe.new_empty(k_pe.shape, dtype=attn_dtype)
 
@@ -201,6 +200,8 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         cos_sin_cache_f32 = self.rotary_emb.cos_sin_cache.float()
 
         # Call fused kernel - applies RoPE and FP8 quant to both Q and K
+        # Note: FlashInfer uses multiply convention (FP8 = x * scale) while
+        # vLLM uses divide convention (FP8 = x / scale), so we pass reciprocal.
         mla_rope_quantize_fp8(
             q_rope=q_pe,
             k_rope=k_pe,
@@ -210,13 +211,16 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             pos_ids=positions,
             is_neox=False,  # MLA uses GPT-J style RoPE
             quantize_dtype=attn_dtype,
-            q_rope_out=q_out[..., L:],  # RoPE portion goes after nope
-            q_nope_out=q_out[..., :L],  # nope portion goes first
+            q_rope_out=q_pe_fp8,
+            q_nope_out=q_nope_fp8,
             k_rope_out=k_pe_out,
             k_nope_out=k_nope_out,
-            quant_scale_q=q_scale,
-            quant_scale_kv=k_scale,
+            quant_scale_q=1.0 / q_scale,
+            quant_scale_kv=1.0 / k_scale,
         )
+
+        # Concatenate Q: nope first, then rope (matches unfused path)
+        q_out = torch.cat([q_nope_fp8, q_pe_fp8], dim=-1)
 
         return q_out, k_nope_out, k_pe_out
 
