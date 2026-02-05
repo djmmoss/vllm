@@ -21,6 +21,7 @@ from torch import nn
 from transformers import BatchFeature
 from transformers.processing_utils import ProcessorMixin
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_pp_group
@@ -62,12 +63,15 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import KimiK25Config
 from vllm.transformers_utils.processor import cached_get_image_processor
+from vllm.utils.deep_gemm import per_block_cast_to_fp8
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .utils import PPMissingLayer, is_pp_missing_parameter, maybe_prefix
 
 logger = init_logger(__name__)
 
+# MLA projection modules that should be quantized to FP8 when VLLM_MLA_FP8_PROJ=1
+MLA_FP8_PROJ_MODULES = ["q_b_proj"]
 
 # Dummy input dimensions for profiling.
 @dataclass
@@ -462,7 +466,44 @@ class KimiK25ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP)
             num_redundant_experts=0,
         )
 
+
+    def _maybe_quantize_mla_proj_weights_to_fp8(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """
+        Quantize MLA projection weights (q_b_proj) from BF16 to FP8 block quant
+        when VLLM_MLA_FP8_PROJ=1.
+        """
+        if not envs.VLLM_MLA_FP8_PROJ:
+            return weights
+
+        weights_dict = dict(weights)
+        weight_block_size = [128, 128]
+
+        # Build list of weights to quantize
+        layers_to_quantize = []
+        for layer_id in range(self.config.text_config.num_hidden_layers):
+            for module in MLA_FP8_PROJ_MODULES:
+                layers_to_quantize.append(f"language_model.model.layers.{layer_id}.self_attn.{module}")
+
+        # Quantize each weight
+        for layer_name in layers_to_quantize:
+            weight_name = f"{layer_name}.weight"
+            if weight_name not in weights_dict:
+                continue
+
+            original_weight = weights_dict[weight_name]
+            # Quantize BF16 -> FP8 with block quantization
+            fp8_weight, fp8_scale = per_block_cast_to_fp8(
+                original_weight, block_size=weight_block_size, use_ue8m0=True
+            )
+            weights_dict[weight_name] = fp8_weight
+            weights_dict[f"{layer_name}.weight_scale_inv"] = fp8_scale
+
+        return list(weights_dict.items())
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        weights = self._maybe_quantize_mla_proj_weights_to_fp8(weights)
         config = self.config.text_config
         _KEYS_TO_MODIFY_MAPPING = {
             "language_model.lm_head": "lm_head",
