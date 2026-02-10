@@ -1314,6 +1314,11 @@ class _ValidateDatasetArgs(argparse.Action):
 
 
 def add_dataset_parser(parser: FlexibleArgumentParser):
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust remote code from huggingface",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--num-prompts",
@@ -1373,6 +1378,11 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         "--disable-shuffle",
         action="store_true",
         help="Disable shuffling of dataset samples for deterministic ordering.",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust remote code from HuggingFace.",
     )
 
     # group for dataset specific arguments
