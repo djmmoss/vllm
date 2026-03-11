@@ -54,7 +54,10 @@ class ParamInfo:
         numel = 1
         for dim in self.shape:
             numel *= dim
-        return numel * torch.finfo(self.dtype).bits // 8
+        if self.dtype.is_floating_point:
+            return numel * torch.finfo(self.dtype).bits // 8
+        else:
+            return numel * torch.iinfo(self.dtype).bits // 8
 
 
 class StaticBufferPool:
@@ -431,7 +434,15 @@ class _ModuleOffloader:
 
         Called after process_weights_after_loading to ensure _cpu_storage
         contains the final processed weights, not stale pre-loading data.
+        Params deleted by process_weights_after_loading (e.g. input_scale
+        renamed to input_global_scale in NVFP4) are pruned.
         """
+        deleted = [
+            name for name, po in self._param_offloaders.items()
+            if not po._param_exists
+        ]
+        for name in deleted:
+            del self._param_offloaders[name]
         for param_offloader in self._param_offloaders.values():
             param_offloader.sync_cpu_storage()
 
@@ -550,11 +561,23 @@ class _BaseParamOffloader(ABC):
 
         Supports dotted names (e.g. 'self_attn.qkv_proj.weight') by
         traversing the module hierarchy.
+
+        Raises AttributeError if the parameter was removed (e.g. by
+        process_weights_after_loading).
         """
         obj: Any = self._module
         for attr in self._param_name.split("."):
             obj = getattr(obj, attr)
         return obj
+
+    @property
+    def _param_exists(self) -> bool:
+        """Check if the parameter still exists on the module."""
+        try:
+            self._param
+            return True
+        except AttributeError:
+            return False
 
     def post_init(self):
         """Initialize offloading (move parameter to storage)."""
