@@ -77,6 +77,16 @@ class SymmMemCommunicator:
                 self.world_size,
             )
             return
+        from vllm.distributed.parallel_state import in_the_same_node_as
+
+        if not all(in_the_same_node_as(group, source_rank=0)):
+            logger.warning(
+                "SymmMemCommunicator: disabled because this process group "
+                "spans across nodes (symmetric memory requires intra-node "
+                "NVLink/NVSwitch). Use VLLM_ALLREDUCE_USE_SYMM_MEM=0 to "
+                "suppress this warning."
+            )
+            return
         # Use override max_size if provided, otherwise use default
         if max_size_override is not None:
             self.max_size = max_size_override
