@@ -178,9 +178,10 @@ def backend_to_kernel_cls(
     elif backend == Fp8MoeBackend.BATCHED_VLLM_CUTLASS:
         from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
             CutlassBatchedExpertsFp8,
+            CutlassBatchedExpertsMxfp8,
         )
 
-        return [CutlassBatchedExpertsFp8]
+        return [CutlassBatchedExpertsMxfp8, CutlassBatchedExpertsFp8]
 
     elif backend == Fp8MoeBackend.XPU:
         from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
@@ -489,6 +490,13 @@ def convert_to_fp8_moe_kernel_format(
         )
 
         w13, w2 = prepare_fp8_moe_layer_for_cpu(w13, w2)
+    elif fp8_backend == Fp8MoeBackend.BATCHED_VLLM_CUTLASS and getattr(
+        layer, "weight_block_size", None
+    ) == [1, 32]:
+        w13_scale = w13_scale.contiguous().view(w13_scale.size(0), -1)
+        w2_scale = w2_scale.contiguous().view(w2_scale.size(0), -1)
+        w13 = w13.transpose(1, 2)
+        w2 = w2.transpose(1, 2)
     else:
         if fp8_backend not in [
             Fp8MoeBackend.TRITON,

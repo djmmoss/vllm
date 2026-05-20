@@ -1856,7 +1856,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         self.quant_config = quant_config
         assert self.quant_config.is_checkpoint_mxfp8_serialized
 
-        self.mxfp8_backend, _ = select_mxfp8_moe_backend(self.moe)
+        self.mxfp8_backend, self.experts_cls = select_mxfp8_moe_backend(self.moe)
 
     def create_weights(
         self,
@@ -1950,6 +1950,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             layer.w2_weight_scale,
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
         )
+        layer.weight_block_size = [1, MXFP8_BLOCK_SIZE]
 
     @staticmethod
     def _check_weight_dtypes(layer: torch.nn.Module) -> None:
@@ -2056,8 +2057,39 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             return
 
         self._check_weight_dtypes(layer)
-        self._shuffle_weights_for_trtllm(layer)
+        if self.is_monolithic:
+            self._shuffle_weights_for_trtllm(layer)
+        else:
+            self._setup_kernel(layer)
         layer._already_called_process_weights_after_loading = True
+
+    def _setup_kernel(self, layer: RoutedExperts) -> None:
+        w13, w2, w13_scale, w2_scale = convert_to_fp8_moe_kernel_format(
+            fp8_backend=self.mxfp8_backend,
+            layer=layer,
+            w13=layer.w13_weight,
+            w2=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w13_input_scale=None,
+            w2_input_scale=None,
+        )
+
+        replace_parameter(layer, "w13_weight", w13)
+        replace_parameter(layer, "w2_weight", w2)
+        replace_parameter(layer, "w13_weight_scale", w13_scale)
+        replace_parameter(layer, "w2_weight_scale", w2_scale)
+
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        assert self.moe_quant_config is not None
+        assert self.experts_cls is not None
+        self.moe_kernel = make_fp8_moe_kernel(
+            moe_quant_config=self.moe_quant_config,
+            moe_config=self.moe,
+            fp8_backend=self.mxfp8_backend,
+            experts_cls=self.experts_cls,
+            routing_tables=layer._expert_routing_tables(),
+        )
 
     def maybe_make_prepare_finalize(
         self,
@@ -2081,8 +2113,19 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
-        # TRTLLM MXFP8 path is monolithic and does not use modular kernel config.
-        return None
+        if self.is_monolithic:
+            # TRTLLM MXFP8 path is monolithic and does not use modular kernel config.
+            return None
+
+        return make_fp8_moe_quant_config(
+            fp8_backend=self.mxfp8_backend,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a1_scale=None,
+            a2_scale=None,
+            block_shape=[1, MXFP8_BLOCK_SIZE],
+            swiglu_limit=getattr(layer, "swiglu_limit", None),
+        )
 
     @property
     def is_monolithic(self) -> bool:
@@ -2182,8 +2225,19 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert not self.is_monolithic
-        raise NotImplementedError(
-            "Non-monolithic MXFP8 MoE path is not yet implemented."
+        assert self.moe_kernel is not None
+        return self.moe_kernel.apply(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights,
+            topk_ids,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            expert_map=layer.expert_map,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            shared_experts=shared_experts,
+            shared_experts_input=shared_experts_input,
         )
 
 

@@ -5,6 +5,7 @@ Test deepep dispatch-combine logic
 """
 
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 import torch.distributed
@@ -14,7 +15,10 @@ from tests.kernels.moe.utils import make_dummy_moe_config
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import TritonExperts
+from vllm.model_executor.layers.fused_moe import (
+    CutlassBatchedExpertsMxfp8,
+    TritonExperts,
+)
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
@@ -23,9 +27,14 @@ from vllm.model_executor.layers.fused_moe.experts.fused_batched_moe import (
     BatchedTritonExperts,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+    Fp8MoeBackend,
+    convert_to_fp8_moe_kernel_format,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
+from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_deep_ep
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -49,6 +58,16 @@ requires_deep_ep = pytest.mark.skipif(
 )
 
 MAX_TOKENS_PER_RANK = 64
+
+
+def is_sm100_supported() -> bool:
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        100
+    )
+
+
+def align(val: int, alignment: int = 128) -> int:
+    return int((val + alignment - 1) // alignment * alignment)
 
 
 def make_weights(
@@ -81,6 +100,81 @@ def make_weights(
             w2[expert], use_per_token_if_dynamic=True
         )
     return w1_q, w2_q, w1_scale, w2_scale
+
+
+def quantize_expert_rows_mxfp8(
+    input_tensor: torch.Tensor,
+    rows_per_expert: int,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = input_tensor.device
+    k = input_tensor.size(1)
+    aligned_rows = align(rows_per_expert, 128)
+    problem_sizes = torch.tensor(
+        [[rows_per_expert, rows_per_expert, k]] * num_experts,
+        dtype=torch.int32,
+        device=device,
+    )
+    expert_offsets = torch.arange(num_experts, dtype=torch.int32, device=device)
+    expert_offsets *= rows_per_expert
+    blockscale_offsets = torch.arange(num_experts, dtype=torch.int32, device=device)
+    blockscale_offsets *= aligned_rows
+
+    quant_output = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    scale_factor = torch.empty(
+        (num_experts * aligned_rows, k // 32), dtype=torch.uint8, device=device
+    )
+    ops.mxfp8_experts_quant(
+        input_tensor,
+        problem_sizes,
+        expert_offsets,
+        blockscale_offsets,
+        quant_output,
+        scale_factor,
+    )
+    return quant_output, scale_factor
+
+
+def make_mxfp8_weights(
+    e: int,
+    n: int,
+    k: int,
+    dtype: torch.dtype,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    w1_ref = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 20
+    w2_ref = torch.randn((e, k, n), device="cuda", dtype=dtype) / 20
+
+    w1, w1_scale = quantize_expert_rows_mxfp8(
+        w1_ref.reshape(e * 2 * n, k),
+        2 * n,
+        e,
+    )
+    w1 = w1.view(e, 2 * n, k)
+    w1_scale = w1_scale.view(e, 2 * n, k // 32)
+
+    w2, w2_scale = quantize_expert_rows_mxfp8(
+        w2_ref.reshape(e * k, n),
+        k,
+        e,
+    )
+    w2 = w2.view(e, k, n)
+    w2_scale = w2_scale.view(e, k, n // 32)
+
+    layer = SimpleNamespace(weight_block_size=[1, 32])
+    w1, w2, w1_scale, w2_scale = convert_to_fp8_moe_kernel_format(
+        fp8_backend=Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
+        layer=layer,
+        w13=w1,
+        w2=w2,
+        w13_scale=w1_scale,
+        w2_scale=w2_scale,
+        w13_input_scale=None,
+        w2_input_scale=None,
+    )
+
+    return w1_ref, w2_ref, w1, w2, w1_scale, w2_scale
 
 
 @dataclasses.dataclass
@@ -131,12 +225,16 @@ def make_modular_kernel(
     pgi: ProcessGroupInfo,
     low_latency_mode: bool,
     hidden_size: int,
+    intermediate_size: int,
+    in_dtype: torch.dtype,
     dp_size: int,
     num_experts: int,
     num_local_experts: int,
+    topk: int,
     q_dtype: torch.dtype | None,
     use_fp8_dispatch: bool,
     quant_config: FusedMoEQuantConfig,
+    experts_cls=None,
 ) -> FusedMoEKernel:
     ht_args: DeepEPHTArgs | None = None
     ll_args: DeepEPLLArgs | None = None
@@ -166,11 +264,19 @@ def make_modular_kernel(
 
     num_dispatchers = pgi.world_size // dp_size
 
-    moe_config = make_dummy_moe_config()
+    moe_config = make_dummy_moe_config(
+        num_experts=num_local_experts,
+        experts_per_token=topk,
+        hidden_dim=hidden_size,
+        intermediate_size_per_partition=intermediate_size,
+        in_dtype=in_dtype,
+    )
 
     if low_latency_mode:
         assert not quant_config.per_act_token_quant, "not supported in ll mode"
-        fused_experts = BatchedTritonExperts(
+        if experts_cls is None:
+            experts_cls = BatchedTritonExperts
+        fused_experts = experts_cls(
             max_num_tokens=MAX_TOKENS_PER_RANK,
             num_dispatchers=num_dispatchers,
             moe_config=moe_config,
@@ -203,6 +309,9 @@ def deep_ep_moe_impl(
     num_experts: int,
     use_fp8_dispatch: bool,
     per_act_token_quant: bool,
+    quant_dtype_override: torch.dtype | str | None = None,
+    block_shape: list[int] | None = None,
+    experts_cls=None,
 ) -> torch.Tensor:
     num_local_experts = w1.size(0)
 
@@ -216,9 +325,8 @@ def deep_ep_moe_impl(
         return expert_map.to(device=device, dtype=torch.int32)
 
     hidden_size = test_tensors.rank_tokens.size(1)
-    is_quantized = w1.dtype == torch.float8_e4m3fn
-    q_dtype = None
-    if is_quantized:
+    q_dtype = quant_dtype_override
+    if q_dtype is None and w1.dtype == torch.float8_e4m3fn:
         q_dtype = torch.float8_e4m3fn
 
     out_hidden_states = torch.empty_like(test_tensors.rank_tokens)
@@ -242,6 +350,7 @@ def deep_ep_moe_impl(
             w2_scale=w2_scale,
             per_act_token_quant=per_act_token_quant,
             a1_scale=rank_token_scales_chunk,
+            block_shape=block_shape,
         )
 
         # Make modular kernel
@@ -250,12 +359,16 @@ def deep_ep_moe_impl(
             pgi,
             low_latency_mode,
             hidden_size,
+            test_tensors.config.n,
+            rank_tokens_chunk.dtype,
             dp_size,
             num_experts,
             num_local_experts,
+            topk_chunk.size(1),
             q_dtype,
             use_fp8_dispatch,
             quant_config,
+            experts_cls=experts_cls,
         )
 
         out = mk.apply(
@@ -425,6 +538,72 @@ def _deep_ep_moe(
     )
 
 
+def _deep_ep_mxfp8_moe(
+    pgi: ProcessGroupInfo,
+    dp_size: int,
+    config: TestConfig,
+    w1_ref: torch.Tensor,
+    w2_ref: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+):
+    device = torch.device(f"cuda:{pgi.local_rank}")
+    init_workspace_manager(device)
+
+    device_idx = torch.accelerator.current_device_index()
+    w1_ref = w1_ref.to(device=device_idx)
+    w2_ref = w2_ref.to(device=device_idx)
+    w1 = w1.to(device=device_idx)
+    w2 = w2.to(device=device_idx)
+    w1_scale = w1_scale.to(device=device_idx)
+    w2_scale = w2_scale.to(device=device_idx)
+
+    pg = torch.distributed.new_group(list(range(pgi.world_size)))
+    test_tensors = TestTensors.make(config, low_latency_mode=True)
+
+    with set_current_vllm_config(VllmConfig()):
+        torch_combined = torch_moe_impl(
+            test_tensors,
+            w1_ref,
+            w2_ref,
+            None,
+            None,
+            using_fp8_dispatch=False,
+            per_act_token_quant=False,
+        )
+
+        num_local_experts = config.num_experts // pgi.world_size
+        e_start = num_local_experts * pgi.rank
+        e_end = e_start + num_local_experts
+
+        deepep_combined = deep_ep_moe_impl(
+            pg,
+            pgi,
+            low_latency_mode=True,
+            dp_size=dp_size,
+            test_tensors=test_tensors,
+            w1=w1[e_start:e_end],
+            w2=w2[e_start:e_end],
+            w1_scale=w1_scale[e_start:e_end],
+            w2_scale=w2_scale[e_start:e_end],
+            num_experts=config.num_experts,
+            use_fp8_dispatch=False,
+            per_act_token_quant=False,
+            quant_dtype_override="mxfp8",
+            block_shape=[1, 32],
+            experts_cls=CutlassBatchedExpertsMxfp8,
+        )
+
+    torch.testing.assert_close(
+        torch_combined,
+        deepep_combined,
+        atol=8e-2,
+        rtol=8e-2,
+    )
+
+
 MNKs = [
     (1, 128, 128),
     (2, 128, 512),
@@ -539,4 +718,42 @@ def test_low_latency_deep_ep_moe(
         w2_scale,
         use_fp8_dispatch,
         False,
+    )
+
+
+@pytest.mark.skipif(
+    not is_sm100_supported(),
+    reason="MXFP8 CUTLASS batched experts require CUDA SM100",
+)
+@multi_gpu_test(num_gpus=2)
+@requires_deep_ep
+def test_low_latency_deep_ep_mxfp8_moe(workspace_init):
+    set_random_seed(7)
+    world_size, dp_size = (2, 1)
+    config = TestConfig(
+        dtype=torch.bfloat16,
+        topk=1,
+        m=1,
+        k=2560,
+        n=128,
+        num_experts=32,
+    )
+    w1_ref, w2_ref, w1, w2, w1_scale, w2_scale = make_mxfp8_weights(
+        config.num_experts,
+        config.n,
+        config.k,
+        config.dtype,
+    )
+
+    parallel_launch(
+        world_size,
+        _deep_ep_mxfp8_moe,
+        dp_size,
+        config,
+        w1_ref,
+        w2_ref,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
     )

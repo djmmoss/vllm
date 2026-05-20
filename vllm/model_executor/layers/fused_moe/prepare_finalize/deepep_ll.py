@@ -214,6 +214,8 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 q_dtype,
                 quant_config.per_act_token_quant,
                 quant_config.block_shape,
+                is_scale_swizzled=quant_config.is_scale_swizzled,
+                mx_alignment=quant_config.mx_alignment,
             )
             x = x.view((num_experts, -1, hidden_dim))
 
@@ -237,10 +239,10 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
     ) -> tuple[Callable, mk.ReceiverType]:
-        if defer_input_quant:
+        if defer_input_quant and self.use_fp8_dispatch:
             raise NotImplementedError(
-                f"{self.__class__.__name__} does not support defer_input_quant=True. "
-                "Please select an MoE kernel that accepts quantized inputs."
+                f"{self.__class__.__name__} does not support defer_input_quant=True "
+                "when use_fp8_dispatch=True."
             )
 
         hidden_size = a1.size(1)
@@ -322,6 +324,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 quant_config.a1_scale,
                 a1.dtype,
                 quant_config,
+                defer_input_quant=defer_input_quant,
             ),
         )
 
@@ -332,8 +335,13 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         a1_scale: torch.Tensor | None,
         a1_dtype: torch.dtype,
         quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
-        expert_x, expert_x_scale = self._do_quant(expert_x, a1_dtype, quant_config)
+        if defer_input_quant:
+            assert isinstance(expert_x, torch.Tensor)
+            expert_x_scale = None
+        else:
+            expert_x, expert_x_scale = self._do_quant(expert_x, a1_dtype, quant_config)
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=expert_num_tokens, expert_num_tokens_cpu=None
@@ -352,11 +360,6 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
-        if defer_input_quant:
-            raise NotImplementedError(
-                f"{self.__class__.__name__} does not support defer_input_quant=True. "
-                "Please select an MoE kernel that accepts quantized inputs."
-            )
         hook, receiver = self.prepare_async(
             a1,
             topk_weights,
@@ -365,6 +368,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_map,
             apply_router_weight_on_input,
             quant_config,
+            defer_input_quant,
         )
         hook()
         return receiver()
