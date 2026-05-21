@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
+    swizzle_mxfp8_scale,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -423,6 +424,19 @@ def select_fp8_moe_backend(
     return Fp8MoeBackend.NONE, None
 
 
+def _swizzle_batched_cutlass_mxfp8_weight_scale(
+    scale: torch.Tensor,
+    n: int,
+    k: int,
+) -> torch.Tensor:
+    """Convert row-major MXFP8 weight scales to CUTLASS grouped-MM layout."""
+    num_experts = scale.size(0)
+    scale_cols = k // MXFP8_BLOCK_SIZE
+    row_major = scale.contiguous().view(num_experts, n, scale_cols)
+    swizzled = [swizzle_mxfp8_scale(row_major[e], M=n, K=k) for e in range(num_experts)]
+    return torch.stack(swizzled, dim=0).view(num_experts, -1)
+
+
 def convert_to_fp8_moe_kernel_format(
     fp8_backend: Fp8MoeBackend,
     layer: torch.nn.Module,
@@ -496,8 +510,12 @@ def convert_to_fp8_moe_kernel_format(
     elif fp8_backend == Fp8MoeBackend.BATCHED_VLLM_CUTLASS and getattr(
         layer, "weight_block_size", None
     ) == [1, MXFP8_BLOCK_SIZE]:
-        w13_scale = w13_scale.contiguous().view(w13_scale.size(0), -1)
-        w2_scale = w2_scale.contiguous().view(w2_scale.size(0), -1)
+        w13_scale = _swizzle_batched_cutlass_mxfp8_weight_scale(
+            w13_scale, n=w13.size(1), k=w13.size(2)
+        )
+        w2_scale = _swizzle_batched_cutlass_mxfp8_weight_scale(
+            w2_scale, n=w2.size(1), k=w2.size(2)
+        )
         w13 = w13.transpose(1, 2)
         w2 = w2.transpose(1, 2)
     else:

@@ -14,7 +14,6 @@ from torch.distributed import ProcessGroup
 from tests.kernels.moe.utils import (
     is_sm100_supported,
     make_dummy_moe_config,
-    quantize_expert_rows_mxfp8,
 )
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -40,6 +39,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
+    mxfp8_e4m3_quantize,
 )
 from vllm.utils.import_utils import has_deep_ep
 from vllm.utils.torch_utils import set_random_seed
@@ -109,21 +109,18 @@ def make_mxfp8_weights(
     w1_ref = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 20
     w2_ref = torch.randn((e, k, n), device="cuda", dtype=dtype) / 20
 
-    w1, w1_scale = quantize_expert_rows_mxfp8(
-        w1_ref.reshape(e * 2 * n, k),
-        2 * n,
-        e,
-    )
-    w1 = w1.view(e, 2 * n, k)
-    w1_scale = w1_scale.view(e, 2 * n, k // MXFP8_BLOCK_SIZE)
-
-    w2, w2_scale = quantize_expert_rows_mxfp8(
-        w2_ref.reshape(e * k, n),
-        k,
-        e,
-    )
-    w2 = w2.view(e, k, n)
-    w2_scale = w2_scale.view(e, k, n // MXFP8_BLOCK_SIZE)
+    w1_quantized = [
+        mxfp8_e4m3_quantize(w1_ref[expert], is_sf_swizzled_layout=False)
+        for expert in range(e)
+    ]
+    w2_quantized = [
+        mxfp8_e4m3_quantize(w2_ref[expert], is_sf_swizzled_layout=False)
+        for expert in range(e)
+    ]
+    w1 = torch.stack([q for q, _ in w1_quantized], dim=0)
+    w1_scale = torch.stack([scale for _, scale in w1_quantized], dim=0)
+    w2 = torch.stack([q for q, _ in w2_quantized], dim=0)
+    w2_scale = torch.stack([scale for _, scale in w2_quantized], dim=0)
 
     layer = SimpleNamespace(weight_block_size=[1, MXFP8_BLOCK_SIZE])
     w1, w2, w1_scale, w2_scale = convert_to_fp8_moe_kernel_format(

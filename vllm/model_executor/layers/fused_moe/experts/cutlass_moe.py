@@ -32,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
+    swizzle_mxfp8_scale,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -347,7 +348,11 @@ def _format_deepep_mxfp8_scales_for_cutlass(
     assert scale_rows == num_experts * scale_stride
     assert act_scales.size(1) == scale_stride
 
-    return act_scales.reshape(scale_rows, num_scale_groups)
+    swizzled = [
+        swizzle_mxfp8_scale(act_scales[e], M=scale_stride, K=hidden_dim)
+        for e in range(num_experts)
+    ]
+    return torch.stack(swizzled, dim=0).view(scale_rows, num_scale_groups)
 
 
 def run_cutlass_batched_moe_mxfp8(
