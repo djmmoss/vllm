@@ -759,6 +759,17 @@ class FusedMoEExperts(ABC):
         """
         return False
 
+    def supports_native_mxfp8_act_scales(self) -> bool:
+        """
+        Whether this class can process native DeepEP MXFP8 activation scales.
+        """
+        return False
+
+    def enable_native_mxfp8_dispatch(self) -> None:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support native MXFP8 dispatch"
+        )
+
 
 class FusedMoEExpertsModular(FusedMoEExperts):
     """

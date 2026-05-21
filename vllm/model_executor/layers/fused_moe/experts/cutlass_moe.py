@@ -327,6 +327,26 @@ def _mxfp8_quantize_batched_experts(
     return input_quant, input_scale
 
 
+def _format_deepep_mxfp8_scales_for_cutlass(
+    act_scales: torch.Tensor,
+    max_num_tokens: int,
+    hidden_dim: int,
+    scale_rows: int,
+) -> torch.Tensor:
+    num_scale_groups_32 = hidden_dim // 32
+    assert act_scales.dtype == torch.uint8
+    assert act_scales.dim() == 3
+    assert act_scales.is_contiguous()
+    assert act_scales.size(2) == num_scale_groups_32
+
+    num_experts = act_scales.size(0)
+    scale_stride = _align_to(max_num_tokens, 128)
+    assert scale_rows == num_experts * scale_stride
+    assert act_scales.size(1) == scale_stride
+
+    return act_scales.reshape(scale_rows, num_scale_groups_32)
+
+
 def run_cutlass_batched_moe_mxfp8(
     output: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -338,12 +358,12 @@ def run_cutlass_batched_moe_mxfp8(
     activation: MoEActivation,
     workspace13: torch.Tensor,
     workspace2: torch.Tensor,
+    a1q_scale: torch.Tensor | None = None,
 ) -> None:
     assert hidden_states.dim() == 3
     assert output.shape == hidden_states.shape
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
     assert output.is_contiguous(), "output must be contiguous"
-    assert hidden_states.dtype in (torch.float16, torch.bfloat16)
     assert w1.dtype == torch.float8_e4m3fn
     assert w2.dtype == torch.float8_e4m3fn
     assert w1_scale.dtype == torch.uint8
@@ -372,15 +392,29 @@ def run_cutlass_batched_moe_mxfp8(
         )
     )
 
-    a1q, a1q_scale = _mxfp8_quantize_batched_experts(
-        hidden_states_flat,
-        problem_sizes1,
-        expert_offsets,
-        blockscale_offsets,
-        scale_rows1,
-        workspace2,
-    )
+    if a1q_scale is not None:
+        assert hidden_states.dtype == torch.float8_e4m3fn
+        a1q = hidden_states_flat
+        a1q_scale = _format_deepep_mxfp8_scales_for_cutlass(
+            a1q_scale,
+            max_num_tokens=max_num_tokens,
+            hidden_dim=hidden_dim,
+            scale_rows=scale_rows1,
+        )
+        assert a1q_scale.dtype == torch.uint8
+    else:
+        assert hidden_states.dtype in (torch.float16, torch.bfloat16)
+        a1q, a1q_scale = _mxfp8_quantize_batched_experts(
+            hidden_states_flat,
+            problem_sizes1,
+            expert_offsets,
+            blockscale_offsets,
+            scale_rows1,
+            workspace2,
+        )
 
+    # gemm1 can consume DeepEP-dispatched MXFP8 activations; gemm2's input is
+    # produced locally by the activation kernel, so it is always quantized here.
     gemm1_out = _resize_cache(workspace13, (num_experts * max_num_tokens, gemm1_n))
     ops.cutlass_mxfp8_grouped_mm(
         a1q,
@@ -660,10 +694,13 @@ class CutlassBatchedExpertsMxfp8(mk.FusedMoEExpertsModular):
         assert quant_config.weight_quant_dtype == "mxfp8"
         assert quant_config.block_shape == [1, 32]
         self.out_dtype = moe_config.in_dtype
+        # DeepEPLLPrepareAndFinalize flips this during FusedMoEKernel
+        # post-init before the first prepare call.
+        self.use_native_mxfp8_dispatch = False
 
     @property
     def expects_unquantized_inputs(self) -> bool:
-        return True
+        return not self.use_native_mxfp8_dispatch
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -701,6 +738,12 @@ class CutlassBatchedExpertsMxfp8(mk.FusedMoEExpertsModular):
 
     def supports_expert_map(self) -> bool:
         return False
+
+    def supports_native_mxfp8_act_scales(self) -> bool:
+        return True
+
+    def enable_native_mxfp8_dispatch(self) -> None:
+        self.use_native_mxfp8_dispatch = True
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceDelegate()
@@ -767,7 +810,10 @@ class CutlassBatchedExpertsMxfp8(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
-        assert a1q_scale is None
+        if a1q_scale is not None:
+            assert hidden_states.dtype == torch.float8_e4m3fn
+        else:
+            assert hidden_states.dtype in (torch.float16, torch.bfloat16)
         assert a2_scale is None
         assert expert_tokens_meta is not None
         assert self.w1_scale is not None
@@ -783,6 +829,7 @@ class CutlassBatchedExpertsMxfp8(mk.FusedMoEExpertsModular):
             activation=activation,
             workspace13=workspace13,
             workspace2=workspace2,
+            a1q_scale=a1q_scale,
         )
 
 

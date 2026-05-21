@@ -234,6 +234,7 @@ def make_modular_kernel(
     q_dtype: torch.dtype | None,
     use_fp8_dispatch: bool,
     quant_config: FusedMoEQuantConfig,
+    use_mxfp8_dispatch: bool = False,
     experts_cls=None,
 ) -> FusedMoEKernel:
     ht_args: DeepEPHTArgs | None = None
@@ -245,6 +246,7 @@ def make_modular_kernel(
             hidden_size=hidden_size,
             num_experts=num_experts,
             use_fp8_dispatch=use_fp8_dispatch,
+            use_mxfp8_dispatch=use_mxfp8_dispatch,
         )
     else:
         assert not use_fp8_dispatch, (
@@ -311,6 +313,7 @@ def deep_ep_moe_impl(
     per_act_token_quant: bool,
     quant_dtype_override: torch.dtype | str | None = None,
     block_shape: list[int] | None = None,
+    use_mxfp8_dispatch: bool = False,
     experts_cls=None,
 ) -> torch.Tensor:
     num_local_experts = w1.size(0)
@@ -368,6 +371,7 @@ def deep_ep_moe_impl(
             q_dtype,
             use_fp8_dispatch,
             quant_config,
+            use_mxfp8_dispatch=use_mxfp8_dispatch,
             experts_cls=experts_cls,
         )
 
@@ -412,6 +416,8 @@ def torch_moe_impl(
     w2_scale: torch.Tensor | None,
     using_fp8_dispatch: bool,
     per_act_token_quant: bool,
+    use_ue8m0_dispatch: bool = False,
+    dispatch_group_size: int = 128,
 ):
     a, topk_ids, topk_weights = (
         test_tensors.rank_tokens,
@@ -424,9 +430,11 @@ def torch_moe_impl(
         # blockwise quant and de-quant.
         assert not per_act_token_quant
         a = test_tensors.rank_tokens
-        aq, aq_scale = per_token_group_quant_fp8(a, 128, use_ue8m0=False)
+        aq, aq_scale = per_token_group_quant_fp8(
+            a, dispatch_group_size, use_ue8m0=use_ue8m0_dispatch
+        )
         a = (
-            (aq.view(-1, 128).to(torch.float32) * aq_scale.view(-1, 1))
+            (aq.view(-1, dispatch_group_size).to(torch.float32) * aq_scale.view(-1, 1))
             .view(a.shape)
             .to(a.dtype)
         )
@@ -548,6 +556,7 @@ def _deep_ep_mxfp8_moe(
     w2: torch.Tensor,
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
+    use_mxfp8_dispatch: bool = False,
 ):
     device = torch.device(f"cuda:{pgi.local_rank}")
     init_workspace_manager(device)
@@ -570,8 +579,10 @@ def _deep_ep_mxfp8_moe(
             w2_ref,
             None,
             None,
-            using_fp8_dispatch=False,
+            using_fp8_dispatch=use_mxfp8_dispatch,
             per_act_token_quant=False,
+            use_ue8m0_dispatch=use_mxfp8_dispatch,
+            dispatch_group_size=32 if use_mxfp8_dispatch else 128,
         )
 
         num_local_experts = config.num_experts // pgi.world_size
@@ -589,19 +600,30 @@ def _deep_ep_mxfp8_moe(
             w1_scale=w1_scale[e_start:e_end],
             w2_scale=w2_scale[e_start:e_end],
             num_experts=config.num_experts,
-            use_fp8_dispatch=False,
+            use_fp8_dispatch=use_mxfp8_dispatch,
             per_act_token_quant=False,
             quant_dtype_override="mxfp8",
             block_shape=[1, 32],
+            use_mxfp8_dispatch=use_mxfp8_dispatch,
             experts_cls=CutlassBatchedExpertsMxfp8,
         )
 
-    torch.testing.assert_close(
-        torch_combined,
-        deepep_combined,
-        atol=8e-2,
-        rtol=8e-2,
-    )
+    if use_mxfp8_dispatch:
+        # Native MXFP8 dispatch quantizes activations before the all-to-all, so
+        # it has additional quantization error versus BF16 dispatch.
+        torch.testing.assert_close(
+            torch_combined,
+            deepep_combined,
+            atol=2.5e-1,
+            rtol=2e-1,
+        )
+    else:
+        torch.testing.assert_close(
+            torch_combined,
+            deepep_combined,
+            atol=8e-2,
+            rtol=8e-2,
+        )
 
 
 MNKs = [
@@ -756,4 +778,48 @@ def test_low_latency_deep_ep_mxfp8_moe(workspace_init):
         w2,
         w1_scale,
         w2_scale,
+    )
+
+
+@pytest.mark.skipif(
+    not is_sm100_supported(),
+    reason="MXFP8 CUTLASS batched experts require CUDA SM100",
+)
+@pytest.mark.parametrize("m,topk", [(1, 1), (3, 2), (MAX_TOKENS_PER_RANK, 1)])
+@multi_gpu_test(num_gpus=2)
+@requires_deep_ep
+def test_low_latency_deep_ep_mxfp8_native_dispatch_moe(
+    m: int,
+    topk: int,
+    workspace_init,
+):
+    set_random_seed(7)
+    world_size, dp_size = (2, 1)
+    config = TestConfig(
+        dtype=torch.bfloat16,
+        topk=topk,
+        m=m,
+        k=2560,
+        n=128,
+        num_experts=32,
+    )
+    w1_ref, w2_ref, w1, w2, w1_scale, w2_scale = make_mxfp8_weights(
+        config.num_experts,
+        config.n,
+        config.k,
+        config.dtype,
+    )
+
+    parallel_launch(
+        world_size,
+        _deep_ep_mxfp8_moe,
+        dp_size,
+        config,
+        w1_ref,
+        w2_ref,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        True,
     )

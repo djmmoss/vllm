@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe.activation import (
     apply_moe_activation,
 )
 from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
+    _format_deepep_mxfp8_scales_for_cutlass,
     _make_batched_mxfp8_problem_data,
     run_cutlass_batched_moe_mxfp8,
 )
@@ -208,6 +209,48 @@ def test_make_batched_mxfp8_problem_data():
     assert expert_offsets.tolist() == [0, 160, 320]
     assert blockscale_offsets.tolist() == [0, 256, 512]
     assert scale_rows == 768
+
+
+def test_format_deepep_mxfp8_scales_for_cutlass():
+    act_scales = torch.arange(2 * 128 * 16, dtype=torch.uint8).view(2, 128, 16)
+
+    formatted = _format_deepep_mxfp8_scales_for_cutlass(
+        act_scales,
+        max_num_tokens=64,
+        hidden_dim=512,
+        scale_rows=256,
+    )
+
+    assert formatted.shape == (256, 16)
+    assert torch.equal(formatted[:128], act_scales[0])
+    assert torch.equal(formatted[128:], act_scales[1])
+
+    act_scales = torch.arange(2 * 256 * 16, dtype=torch.uint8).view(2, 256, 16)
+    formatted = _format_deepep_mxfp8_scales_for_cutlass(
+        act_scales,
+        max_num_tokens=129,
+        hidden_dim=512,
+        scale_rows=512,
+    )
+    assert formatted.shape == (512, 16)
+    assert torch.equal(formatted[:256], act_scales[0])
+    assert torch.equal(formatted[256:], act_scales[1])
+
+    with pytest.raises(AssertionError):
+        _format_deepep_mxfp8_scales_for_cutlass(
+            act_scales[:, :128],
+            max_num_tokens=129,
+            hidden_dim=512,
+            scale_rows=512,
+        )
+
+    with pytest.raises(AssertionError):
+        _format_deepep_mxfp8_scales_for_cutlass(
+            torch.empty(2, 256, 32, dtype=torch.uint8)[:, :, ::2],
+            max_num_tokens=129,
+            hidden_dim=512,
+            scale_rows=512,
+        )
 
 
 def test_convert_batched_cutlass_mxfp8_kernel_format():

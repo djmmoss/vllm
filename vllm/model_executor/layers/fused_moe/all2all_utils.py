@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 
+from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
@@ -165,18 +166,24 @@ def maybe_make_prepare_finalize(
         )
         handle = all2all_manager.get_handle(all_to_all_args)
 
+        use_mxfp8_dispatch = (
+            quant_config.quant_dtype == "mxfp8"
+            and quant_config.block_shape == [1, 32]
+            and envs.VLLM_DEEPEPLL_MXFP8_DISPATCH
+        )
         # Note: We may want to use FP8 dispatch just to reduce
         # data movement.
         use_fp8_dispatch = (
             quant_config.quant_dtype == current_platform.fp8_dtype()
             and quant_config.block_shape == DEEPEP_QUANT_BLOCK_SHAPE
-        )
+        ) or use_mxfp8_dispatch
 
         prepare_finalize = DeepEPLLPrepareAndFinalize(
             handle,
             max_tokens_per_rank=moe.max_num_tokens,
             num_dispatchers=all2all_manager.world_size,
             use_fp8_dispatch=use_fp8_dispatch,
+            use_mxfp8_dispatch=use_mxfp8_dispatch,
             global_to_physical=global_to_physical,
             physical_to_global=physical_to_global,
             local_expert_global_ids=local_expert_global_ids,

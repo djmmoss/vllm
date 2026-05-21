@@ -160,6 +160,7 @@ if TYPE_CHECKING:
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_MXFP4_USE_MARLIN: bool | None = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
+    VLLM_DEEPEPLL_MXFP8_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
@@ -1260,6 +1261,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # https://github.com/deepseek-ai/DeepEP/pull/341
     "VLLM_DEEPEPLL_NVFP4_DISPATCH": lambda: bool(
         int(os.getenv("VLLM_DEEPEPLL_NVFP4_DISPATCH", "0"))
+    ),
+    # Whether to use native DeepEPLL MXFP8 dispatch for MXFP8 MoE.
+    # This reduces dispatch bandwidth by letting DeepEP quantize activations
+    # before communication and return per-32 E8M0 activation scales for the
+    # CUTLASS MXFP8 expert.
+    "VLLM_DEEPEPLL_MXFP8_DISPATCH": lambda: bool(
+        int(os.getenv("VLLM_DEEPEPLL_MXFP8_DISPATCH", "0"))
     ),
     # Whether to turn on the outlines cache for V1
     # This cache is unbounded and on disk, so it's not safe to use in

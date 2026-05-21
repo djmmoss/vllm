@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
 from collections.abc import Callable
 
 import deep_ep
@@ -27,8 +28,6 @@ logger = init_logger(__name__)
 # DeepEP kernels quantize dispatch inputs in 128 element chunks.
 DEEPEP_QUANT_BLOCK_SIZE = 128
 DEEPEP_QUANT_BLOCK_SHAPE = [DEEPEP_QUANT_BLOCK_SIZE, DEEPEP_QUANT_BLOCK_SIZE]
-
-logger = init_logger(__name__)
 
 
 def dequant_fp8(
@@ -88,6 +87,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         max_tokens_per_rank: int,
         num_dispatchers: int,
         use_fp8_dispatch: bool = False,
+        use_mxfp8_dispatch: bool = False,
         global_to_physical: torch.Tensor | None = None,
         physical_to_global: torch.Tensor | None = None,
         local_expert_global_ids: torch.Tensor | None = None,
@@ -97,6 +97,11 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.buffer = buffer
         self.max_tokens_per_rank = max_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
+        self.use_mxfp8_dispatch = use_mxfp8_dispatch
+        if self.use_mxfp8_dispatch and not self.use_fp8_dispatch:
+            raise ValueError("Native MXFP8 dispatch requires FP8 dispatch")
+        if self.use_mxfp8_dispatch:
+            self._check_mxfp8_dispatch_api()
         # The dispatch function returns a handle that the combine function
         # requires. We store the handle here so it is available to the
         # combine function.
@@ -114,12 +119,35 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.physical_to_global = _maybe_cast(physical_to_global)
         self.local_expert_global_ids = _maybe_cast(local_expert_global_ids)
 
-        # We don't have enough information to determine if we should dispatch
-        # activation scales in a packed ue8m0 format during object construction
-        # time. This setting is handled by post_init_setup.
-        self.use_ue8m0_dispatch = False
+        # We don't have enough information to determine if legacy FP8 block
+        # dispatch should return packed UE8M0 scales during object construction.
+        # This setting is handled by post_init_setup.
+        self.use_packed_ue8m0_dispatch = False
+
+    def _check_mxfp8_dispatch_api(self) -> None:
+        try:
+            parameters = inspect.signature(self.buffer.low_latency_dispatch).parameters
+        except (TypeError, ValueError):
+            return
+        accepts_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+        )
+        if "use_mxfp8" not in parameters and not accepts_kwargs:
+            raise RuntimeError(
+                "Native DeepEPLL MXFP8 dispatch requires a DeepEP build whose "
+                "Buffer.low_latency_dispatch API accepts `use_mxfp8`."
+            )
 
     def post_init_setup(self, fused_experts: mk.FusedMoEExperts):
+        if self.use_mxfp8_dispatch:
+            if not fused_experts.supports_native_mxfp8_act_scales():
+                raise ValueError(
+                    f"{fused_experts.__class__.__name__} does not support native "
+                    "DeepEPLL MXFP8 activation scales."
+                )
+            fused_experts.enable_native_mxfp8_dispatch()
+            return
+
         if not fused_experts.supports_packed_ue8m0_act_scales():
             # Early exit.
             return
@@ -128,7 +156,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             logger.debug_once(
                 "Update DeepEPLLPrepareFinalize to do packed ue8m0 scales dispatch."
             )
-            self.use_ue8m0_dispatch = True
+            self.use_packed_ue8m0_dispatch = True
         else:
             logger.warning_once(
                 "DeepEPLLPrepareAndFinalize is setup to dispatch raw/unquantized "
@@ -164,6 +192,13 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.use_fp8_dispatch:
+            if quant_config.quant_dtype == "mxfp8" and self.use_mxfp8_dispatch:
+                x, x_scales = x
+                # Native DeepEP MXFP8 dispatch returns per-32 E8M0 scales as
+                # [experts, aligned_tokens, hidden // 32]. The CUTLASS MXFP8
+                # expert formats this layout immediately before gemm1.
+                return x, x_scales
+
             block_k = (
                 quant_config.block_shape[1]
                 if quant_config.block_shape is not None
@@ -291,6 +326,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         # Dispatch
         dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)
+        use_e8m0_dispatch_scales = (
+            self.use_packed_ue8m0_dispatch or self.use_mxfp8_dispatch
+        )
         (
             expert_x,
             expert_num_tokens,
@@ -303,8 +341,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             self.max_tokens_per_rank,
             num_experts,
             use_fp8=self.use_fp8_dispatch,
-            round_scale=self.use_ue8m0_dispatch,
-            use_ue8m0=self.use_ue8m0_dispatch,
+            round_scale=use_e8m0_dispatch_scales,
+            use_ue8m0=use_e8m0_dispatch_scales,
+            **(dict(use_mxfp8=True) if self.use_mxfp8_dispatch else dict()),
             **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
             **(
                 dict(x_global_scale=qc_a1_gscale_or_scale)
