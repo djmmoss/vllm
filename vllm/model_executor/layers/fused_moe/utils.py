@@ -21,6 +21,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp6_utils import (
     quant_dequant_mxfp6,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
     mxfp8_e4m3_quantize,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
@@ -212,7 +213,7 @@ def _mxfp8_e4m3_quantize(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert A_scale is None
     assert not per_act_token_quant
-    assert block_shape is None or block_shape == [1, 32]
+    assert block_shape is None or block_shape == [1, MXFP8_BLOCK_SIZE]
     return mxfp8_e4m3_quantize(A, is_sf_swizzled_layout, mx_alignment)
 
 

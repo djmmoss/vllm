@@ -19,6 +19,9 @@ from vllm.model_executor.layers.fused_moe.utils import trtllm_moe_pack_topk_ids_
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     activation_to_flashinfer_int,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
@@ -177,7 +180,7 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
 
         assert a1q_scale is not None
 
-        is_mxfp8 = self.quant_config.block_shape == [1, 32]
+        is_mxfp8 = self.quant_config.block_shape == [1, MXFP8_BLOCK_SIZE]
         if is_mxfp8:
             fp8_quant_type = Fp8QuantizationType.MxFp8
             use_shuffled_weight = True
@@ -327,13 +330,13 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         assert self.topk <= global_num_experts
         assert self.topk <= 10
         assert global_num_experts % 4 == 0
-        assert self.quant_config.block_shape in [[128, 128], [1, 32]]
+        assert self.quant_config.block_shape in [[128, 128], [1, MXFP8_BLOCK_SIZE]]
         # Kernel expects #experts <= #threads 512
         assert global_num_experts <= 512
         # TODO: fuse into the quant kernel.
         assert a1q_scale is not None
 
-        is_mxfp8 = self.quant_config.block_shape == [1, 32]
+        is_mxfp8 = self.quant_config.block_shape == [1, MXFP8_BLOCK_SIZE]
         if is_mxfp8:
             fp8_quant_type = Fp8QuantizationType.MxFp8
             use_shuffled_weight = True

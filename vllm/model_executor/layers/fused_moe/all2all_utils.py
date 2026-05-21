@@ -29,6 +29,9 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_nvlink_one
 from vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_nvlink_two_sided import (  # noqa: E501
     FlashInferNVLinkTwoSidedPrepareAndFinalize,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+)
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_deep_ep, has_mori, has_nixl_ep
 
@@ -168,7 +171,7 @@ def maybe_make_prepare_finalize(
 
         use_mxfp8_dispatch = (
             quant_config.quant_dtype == "mxfp8"
-            and quant_config.block_shape == [1, 32]
+            and quant_config.block_shape == [1, MXFP8_BLOCK_SIZE]
             and envs.VLLM_DEEPEPLL_MXFP8_DISPATCH
         )
         # Note: We may want to use FP8 dispatch just to reduce
@@ -251,7 +254,7 @@ def maybe_make_prepare_finalize(
                 padded_k = ((moe.hidden_dim + align - 1) // align) * align
             else:
                 padded_k = moe.hidden_dim
-            dispatch_scale_bytes_per_token = padded_k // 32
+            dispatch_scale_bytes_per_token = padded_k // MXFP8_BLOCK_SIZE
         else:
             raise NotImplementedError(
                 "flashinfer_nvlink_one_sided dispatch supports nvfp4, mxfp8, "

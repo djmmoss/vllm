@@ -29,6 +29,9 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
     prepare_fp8_moe_layer_for_marlin,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
@@ -444,7 +447,7 @@ def convert_to_fp8_moe_kernel_format(
         w13, w2 = rocm_aiter_ops.shuffle_weights(w13, w2)
     elif fp8_backend == Fp8MoeBackend.MARLIN:
         weight_block_size = getattr(layer, "weight_block_size", None)
-        if weight_block_size == [1, 32]:
+        if weight_block_size == [1, MXFP8_BLOCK_SIZE]:
             from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
                 prepare_mxfp8_moe_layer_for_marlin,
             )
@@ -492,7 +495,7 @@ def convert_to_fp8_moe_kernel_format(
         w13, w2 = prepare_fp8_moe_layer_for_cpu(w13, w2)
     elif fp8_backend == Fp8MoeBackend.BATCHED_VLLM_CUTLASS and getattr(
         layer, "weight_block_size", None
-    ) == [1, 32]:
+    ) == [1, MXFP8_BLOCK_SIZE]:
         w13_scale = w13_scale.contiguous().view(w13_scale.size(0), -1)
         w2_scale = w2_scale.contiguous().view(w2_scale.size(0), -1)
         w13 = w13.transpose(1, 2)
@@ -569,7 +572,7 @@ def make_fp8_moe_quant_config(
     # _mxfp8_e4m3_quantize rather than standard FP8 block quantization.
     # Non-swizzled layout is required since the TRTLLM kernel expects
     # scales in (num_tokens, hidden_dim // 32) format.
-    if block_shape == [1, 32]:
+    if block_shape == [1, MXFP8_BLOCK_SIZE]:
         return FusedMoEQuantConfig.make(
             "mxfp8",
             w1_scale=w1_scale,

@@ -127,8 +127,11 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def _check_mxfp8_dispatch_api(self) -> None:
         try:
             parameters = inspect.signature(self.buffer.low_latency_dispatch).parameters
-        except (TypeError, ValueError):
-            return
+        except (TypeError, ValueError) as err:
+            raise RuntimeError(
+                "Unable to verify whether DeepEP Buffer.low_latency_dispatch "
+                "supports native MXFP8 dispatch."
+            ) from err
         accepts_kwargs = any(
             p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
         )
@@ -145,7 +148,6 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                     f"{fused_experts.__class__.__name__} does not support native "
                     "DeepEPLL MXFP8 activation scales."
                 )
-            fused_experts.enable_native_mxfp8_dispatch()
             return
 
         if not fused_experts.supports_packed_ue8m0_act_scales():
@@ -163,6 +165,13 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 f"activations despite ({fused_experts.__class__.__name__}) being able "
                 "to support quantized activations.",
             )
+
+    def defer_input_quant(self, fused_experts: mk.FusedMoEExperts) -> bool:
+        if self.use_mxfp8_dispatch:
+            # Native MXFP8 dispatch returns E4M3 activations plus E8M0
+            # per-32 scales, so the expert must consume them directly.
+            return False
+        return super().defer_input_quant(fused_experts)
 
     def num_dispatchers(self) -> int:
         return self.num_dispatchers_

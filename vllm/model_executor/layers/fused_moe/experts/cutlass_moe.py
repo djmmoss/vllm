@@ -30,6 +30,9 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8DynamicTensorSym,
@@ -312,7 +315,7 @@ def _mxfp8_quantize_batched_experts(
         quant_output.view(dtype=torch.float8_e4m3fn), input_tensor.shape
     )
     input_scale = torch.empty(
-        (scale_rows, k // 32),
+        (scale_rows, k // MXFP8_BLOCK_SIZE),
         dtype=torch.uint8,
         device=input_tensor.device,
     )
@@ -333,18 +336,18 @@ def _format_deepep_mxfp8_scales_for_cutlass(
     hidden_dim: int,
     scale_rows: int,
 ) -> torch.Tensor:
-    num_scale_groups_32 = hidden_dim // 32
+    num_scale_groups = hidden_dim // MXFP8_BLOCK_SIZE
     assert act_scales.dtype == torch.uint8
     assert act_scales.dim() == 3
     assert act_scales.is_contiguous()
-    assert act_scales.size(2) == num_scale_groups_32
+    assert act_scales.size(2) == num_scale_groups
 
     num_experts = act_scales.size(0)
     scale_stride = _align_to(max_num_tokens, 128)
     assert scale_rows == num_experts * scale_stride
     assert act_scales.size(1) == scale_stride
 
-    return act_scales.reshape(scale_rows, num_scale_groups_32)
+    return act_scales.reshape(scale_rows, num_scale_groups)
 
 
 def run_cutlass_batched_moe_mxfp8(
@@ -692,15 +695,14 @@ class CutlassBatchedExpertsMxfp8(mk.FusedMoEExpertsModular):
         )
         assert quant_config.quant_dtype == "mxfp8"
         assert quant_config.weight_quant_dtype == "mxfp8"
-        assert quant_config.block_shape == [1, 32]
+        assert quant_config.block_shape == [1, MXFP8_BLOCK_SIZE]
         self.out_dtype = moe_config.in_dtype
-        # DeepEPLLPrepareAndFinalize flips this during FusedMoEKernel
-        # post-init before the first prepare call.
-        self.use_native_mxfp8_dispatch = False
 
     @property
     def expects_unquantized_inputs(self) -> bool:
-        return not self.use_native_mxfp8_dispatch
+        # Non-native prepare paths send BF16 activations for local MXFP8
+        # quantization. DeepEPLL native MXFP8 overrides the prepare policy.
+        return True
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -741,9 +743,6 @@ class CutlassBatchedExpertsMxfp8(mk.FusedMoEExpertsModular):
 
     def supports_native_mxfp8_act_scales(self) -> bool:
         return True
-
-    def enable_native_mxfp8_dispatch(self) -> None:
-        self.use_native_mxfp8_dispatch = True
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceDelegate()
@@ -1310,7 +1309,7 @@ def swizzle_mxfp4_scales(
     with kIdx = col_in_scale_space (i.e., index into K//32).
     """
     assert scales.dtype == torch.uint8
-    num_scale_cols = K // 32  # number of E8M0 scale values per row
+    num_scale_cols = K // MXFP8_BLOCK_SIZE
 
     num_m_tiles = (N + 127) // 128
     num_k_tiles = (num_scale_cols + 3) // 4

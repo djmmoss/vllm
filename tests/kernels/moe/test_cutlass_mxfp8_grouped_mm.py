@@ -11,6 +11,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.kernels.moe.utils import (
+    is_sm100_supported,
+    quantize_expert_rows_mxfp8,
+)
 from tests.kernels.utils import torch_moe_single
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.activation import (
@@ -26,15 +30,14 @@ from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     Fp8MoeBackend,
     convert_to_fp8_moe_kernel_format,
 )
-from vllm.platforms import current_platform
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+)
+from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import set_random_seed
 
 random.seed(42)
 set_random_seed(42)
-
-
-def align(val: int, alignment: int = 128) -> int:
-    return int((val + alignment - 1) // alignment * alignment)
 
 
 # Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
@@ -43,45 +46,6 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
-
-
-def is_sm100_supported() -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability_family(
-        100
-    )
-
-
-def quantize_expert_rows_mxfp8(
-    input_tensor: torch.Tensor,
-    rows_per_expert: int,
-    num_experts: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    device = input_tensor.device
-    k = input_tensor.size(1)
-    aligned_rows = align(rows_per_expert, 128)
-    problem_sizes = torch.tensor(
-        [[rows_per_expert, rows_per_expert, k]] * num_experts,
-        dtype=torch.int32,
-        device=device,
-    )
-    expert_offsets = torch.arange(num_experts, dtype=torch.int32, device=device)
-    expert_offsets *= rows_per_expert
-    blockscale_offsets = torch.arange(num_experts, dtype=torch.int32, device=device)
-    blockscale_offsets *= aligned_rows
-
-    quant_output = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
-    scale_factor = torch.empty(
-        (num_experts * aligned_rows, k // 32), dtype=torch.uint8, device=device
-    )
-    ops.mxfp8_experts_quant(
-        input_tensor,
-        problem_sizes,
-        expert_offsets,
-        blockscale_offsets,
-        quant_output,
-        scale_factor,
-    )
-    return quant_output, scale_factor
 
 
 def compute_ref_output(
@@ -144,14 +108,18 @@ def compute_kernel_output(
         input_tensor, dtype=torch.float8_e4m3fn, device=device
     )
     input_scale_factor = torch.zeros(
-        (input_blockscale_offset, k_g // 32), dtype=torch.uint8, device=device
+        (input_blockscale_offset, k_g // MXFP8_BLOCK_SIZE),
+        dtype=torch.uint8,
+        device=device,
     )
 
     weight_quant = torch.zeros_like(
         weight_tensor, dtype=torch.float8_e4m3fn, device=device
     )
     weight_scale_factor = torch.zeros(
-        (num_experts, n_g, k_g // 32), dtype=torch.uint8, device=device
+        (num_experts, n_g, k_g // MXFP8_BLOCK_SIZE),
+        dtype=torch.uint8,
+        device=device,
     )
 
     ops.mxfp8_experts_quant(
@@ -173,7 +141,7 @@ def compute_kernel_output(
     )
     weight_quant = weight_quant.view(num_experts, n_g, k_g).transpose(1, 2)
     weight_scale_factor = weight_scale_factor.view(
-        num_experts, n_g, k_g // 32
+        num_experts, n_g, k_g // MXFP8_BLOCK_SIZE
     ).transpose(1, 2)
 
     output = torch.empty((expert_offset, n_g), device=device, dtype=out_dtype)
@@ -258,17 +226,18 @@ def test_convert_batched_cutlass_mxfp8_kernel_format():
     hidden_size = 128
     intermediate_size = 128
     w13_rows = 2 * intermediate_size
-    layer = SimpleNamespace(weight_block_size=[1, 32])
+    layer = SimpleNamespace(weight_block_size=[1, MXFP8_BLOCK_SIZE])
 
     w13 = torch.empty(num_experts, w13_rows, hidden_size, dtype=torch.float8_e4m3fn)
     w2 = torch.empty(
         num_experts, hidden_size, intermediate_size, dtype=torch.float8_e4m3fn
     )
     w13_scale = torch.arange(
-        num_experts * w13_rows * (hidden_size // 32), dtype=torch.uint8
-    ).view(num_experts, w13_rows, hidden_size // 32)
+        num_experts * w13_rows * (hidden_size // MXFP8_BLOCK_SIZE), dtype=torch.uint8
+    ).view(num_experts, w13_rows, hidden_size // MXFP8_BLOCK_SIZE)
     w2_scale = torch.arange(
-        num_experts * hidden_size * (intermediate_size // 32), dtype=torch.uint8
+        num_experts * hidden_size * (intermediate_size // MXFP8_BLOCK_SIZE),
+        dtype=torch.uint8,
     ).view(num_experts, -1)
 
     w13_out, w2_out, w13_scale_out, w2_scale_out = convert_to_fp8_moe_kernel_format(
@@ -328,7 +297,7 @@ def test_cutlass_mxfp8_grouped_mm(num_experts, out_dtype):
         aux_expert_offsets.append(aux_expert_offset)
         aux_expert_offset += n_g
         input_blockscale_offsets.append(input_blockscale_offset)
-        input_blockscale_offset += align(m_g, 128)
+        input_blockscale_offset += round_up(m_g, 128)
         weight_blockscale_offsets.append(weight_blockscale_offset)
         weight_blockscale_offset += n_g  # n_g already align to 128
         problem_sizes.append([m_g, n_g, k_g])
@@ -437,7 +406,7 @@ def test_cutlass_batched_mxfp8_experts(out_dtype):
         num_experts,
     )
     w13_q = w13_q.view(num_experts, w13_rows, hidden_size)
-    w13_scale = w13_scale.view(num_experts, w13_rows, hidden_size // 32)
+    w13_scale = w13_scale.view(num_experts, w13_rows, hidden_size // MXFP8_BLOCK_SIZE)
 
     w2_q, w2_scale = quantize_expert_rows_mxfp8(
         w2.reshape(num_experts * hidden_size, intermediate_size),
@@ -445,9 +414,11 @@ def test_cutlass_batched_mxfp8_experts(out_dtype):
         num_experts,
     )
     w2_q = w2_q.view(num_experts, hidden_size, intermediate_size)
-    w2_scale = w2_scale.view(num_experts, hidden_size, intermediate_size // 32)
+    w2_scale = w2_scale.view(
+        num_experts, hidden_size, intermediate_size // MXFP8_BLOCK_SIZE
+    )
 
-    layer = SimpleNamespace(weight_block_size=[1, 32])
+    layer = SimpleNamespace(weight_block_size=[1, MXFP8_BLOCK_SIZE])
     w13_q, w2_q, w13_scale, w2_scale = convert_to_fp8_moe_kernel_format(
         fp8_backend=Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
         layer=layer,

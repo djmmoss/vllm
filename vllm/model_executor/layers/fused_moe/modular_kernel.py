@@ -197,6 +197,9 @@ class FusedMoEPrepareAndFinalize(ABC):
         """
         return
 
+    def defer_input_quant(self, fused_experts: "FusedMoEExperts") -> bool:
+        return fused_experts.expects_unquantized_inputs
+
     @property
     @abstractmethod
     def activation_format(self) -> FusedMoEActivationFormat:
@@ -765,11 +768,6 @@ class FusedMoEExperts(ABC):
         """
         return False
 
-    def enable_native_mxfp8_dispatch(self) -> None:
-        raise NotImplementedError(
-            f"{self.__class__.__name__} does not support native MXFP8 dispatch"
-        )
-
 
 class FusedMoEExpertsModular(FusedMoEExperts):
     """
@@ -1156,7 +1154,9 @@ class FusedMoEKernelModularImpl:
                 expert_map,
                 apply_router_weight_on_input,
                 self.fused_experts.quant_config,
-                defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+                defer_input_quant=self.prepare_finalize.defer_input_quant(
+                    self.fused_experts
+                ),
             )
         else:
             # Overlap shared expert compute with all2all dispatch.
@@ -1169,7 +1169,9 @@ class FusedMoEKernelModularImpl:
                 expert_map,
                 apply_router_weight_on_input,
                 self.fused_experts.quant_config,
-                defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+                defer_input_quant=self.prepare_finalize.defer_input_quant(
+                    self.fused_experts
+                ),
             )
 
             # TODO(lucas): refactor this in the alternative schedules followup
@@ -1482,7 +1484,9 @@ class FusedMoEKernelMonolithicImpl:
             hidden_states,
             router_logits=router_logits,
             quant_config=self.fused_experts.quant_config,
-            defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+            defer_input_quant=self.prepare_finalize.defer_input_quant(
+                self.fused_experts
+            ),
         )
 
         fused_out = self.fused_experts.apply(

@@ -33,8 +33,53 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.batched import (
 )
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+)
+from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import per_block_cast_to_fp8
 from vllm.utils.math_utils import round_up
+
+
+def is_sm100_supported() -> bool:
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        100
+    )
+
+
+def quantize_expert_rows_mxfp8(
+    input_tensor: torch.Tensor,
+    rows_per_expert: int,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = input_tensor.device
+    k = input_tensor.size(1)
+    aligned_rows = round_up(rows_per_expert, 128)
+    problem_sizes = torch.tensor(
+        [[rows_per_expert, rows_per_expert, k]] * num_experts,
+        dtype=torch.int32,
+        device=device,
+    )
+    expert_offsets = torch.arange(num_experts, dtype=torch.int32, device=device)
+    expert_offsets *= rows_per_expert
+    blockscale_offsets = torch.arange(num_experts, dtype=torch.int32, device=device)
+    blockscale_offsets *= aligned_rows
+
+    quant_output = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    scale_factor = torch.empty(
+        (num_experts * aligned_rows, k // MXFP8_BLOCK_SIZE),
+        dtype=torch.uint8,
+        device=device,
+    )
+    ops.mxfp8_experts_quant(
+        input_tensor,
+        problem_sizes,
+        expert_offsets,
+        blockscale_offsets,
+        quant_output,
+        scale_factor,
+    )
+    return quant_output, scale_factor
 
 
 def shuffle_weight(w: torch.Tensor) -> torch.Tensor:

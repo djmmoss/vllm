@@ -11,7 +11,11 @@ import pytest
 import torch.distributed
 from torch.distributed import ProcessGroup
 
-from tests.kernels.moe.utils import make_dummy_moe_config
+from tests.kernels.moe.utils import (
+    is_sm100_supported,
+    make_dummy_moe_config,
+    quantize_expert_rows_mxfp8,
+)
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -34,7 +38,9 @@ from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
-from vllm.platforms import current_platform
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+)
 from vllm.utils.import_utils import has_deep_ep
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -58,16 +64,6 @@ requires_deep_ep = pytest.mark.skipif(
 )
 
 MAX_TOKENS_PER_RANK = 64
-
-
-def is_sm100_supported() -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability_family(
-        100
-    )
-
-
-def align(val: int, alignment: int = 128) -> int:
-    return int((val + alignment - 1) // alignment * alignment)
 
 
 def make_weights(
@@ -102,39 +98,6 @@ def make_weights(
     return w1_q, w2_q, w1_scale, w2_scale
 
 
-def quantize_expert_rows_mxfp8(
-    input_tensor: torch.Tensor,
-    rows_per_expert: int,
-    num_experts: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    device = input_tensor.device
-    k = input_tensor.size(1)
-    aligned_rows = align(rows_per_expert, 128)
-    problem_sizes = torch.tensor(
-        [[rows_per_expert, rows_per_expert, k]] * num_experts,
-        dtype=torch.int32,
-        device=device,
-    )
-    expert_offsets = torch.arange(num_experts, dtype=torch.int32, device=device)
-    expert_offsets *= rows_per_expert
-    blockscale_offsets = torch.arange(num_experts, dtype=torch.int32, device=device)
-    blockscale_offsets *= aligned_rows
-
-    quant_output = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
-    scale_factor = torch.empty(
-        (num_experts * aligned_rows, k // 32), dtype=torch.uint8, device=device
-    )
-    ops.mxfp8_experts_quant(
-        input_tensor,
-        problem_sizes,
-        expert_offsets,
-        blockscale_offsets,
-        quant_output,
-        scale_factor,
-    )
-    return quant_output, scale_factor
-
-
 def make_mxfp8_weights(
     e: int,
     n: int,
@@ -152,7 +115,7 @@ def make_mxfp8_weights(
         e,
     )
     w1 = w1.view(e, 2 * n, k)
-    w1_scale = w1_scale.view(e, 2 * n, k // 32)
+    w1_scale = w1_scale.view(e, 2 * n, k // MXFP8_BLOCK_SIZE)
 
     w2, w2_scale = quantize_expert_rows_mxfp8(
         w2_ref.reshape(e * k, n),
@@ -160,9 +123,9 @@ def make_mxfp8_weights(
         e,
     )
     w2 = w2.view(e, k, n)
-    w2_scale = w2_scale.view(e, k, n // 32)
+    w2_scale = w2_scale.view(e, k, n // MXFP8_BLOCK_SIZE)
 
-    layer = SimpleNamespace(weight_block_size=[1, 32])
+    layer = SimpleNamespace(weight_block_size=[1, MXFP8_BLOCK_SIZE])
     w1, w2, w1_scale, w2_scale = convert_to_fp8_moe_kernel_format(
         fp8_backend=Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
         layer=layer,
@@ -603,7 +566,7 @@ def _deep_ep_mxfp8_moe(
             use_fp8_dispatch=use_mxfp8_dispatch,
             per_act_token_quant=False,
             quant_dtype_override="mxfp8",
-            block_shape=[1, 32],
+            block_shape=[1, MXFP8_BLOCK_SIZE],
             use_mxfp8_dispatch=use_mxfp8_dispatch,
             experts_cls=CutlassBatchedExpertsMxfp8,
         )
