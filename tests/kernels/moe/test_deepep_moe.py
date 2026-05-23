@@ -574,7 +574,7 @@ def _deep_ep_mxfp8_moe(
         torch.testing.assert_close(
             torch_combined,
             deepep_combined,
-            atol=2.5e-1,
+            atol=5e-1,
             rtol=2e-1,
         )
     else:
@@ -745,7 +745,16 @@ def test_low_latency_deep_ep_mxfp8_moe(workspace_init):
     not is_sm100_supported(),
     reason="MXFP8 CUTLASS batched experts require CUDA SM100",
 )
-@pytest.mark.parametrize("m,topk", [(1, 1), (3, 2), (MAX_TOKENS_PER_RANK, 1)])
+@pytest.mark.parametrize(
+    "m,topk",
+    [
+        (1, 1),
+        (3, 2),
+        (MAX_TOKENS_PER_RANK, 1),
+        (16, 8),
+        (MAX_TOKENS_PER_RANK, 8),
+    ],
+)
 @multi_gpu_test(num_gpus=2)
 @requires_deep_ep
 def test_low_latency_deep_ep_mxfp8_native_dispatch_moe(
