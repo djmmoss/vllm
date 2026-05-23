@@ -313,24 +313,15 @@ def _mxfp8_quantize_batched_experts(
     assert input_tensor.is_contiguous()
     k = input_tensor.size(1)
     # `FusedMoEKernelModularImpl._allocate_buffers` aliases `workspace13` and
-    # the per-MoE-call output buffer to the same storage. When this helper is
-    # called from `run_cutlass_batched_moe_mxfp8` for the gemm2 input, the
-    # caller's `quant_output` argument is `workspace13`, which the subsequent
-    # `cutlass_mxfp8_grouped_mm` then overwrites as the gemm2 output. Letting
-    # `input_quant` view that aliased memory turns the gemm2 source into a
-    # write-after-read race and corrupts the activations partway through the
-    # kernel (NaN in the final logits, all-token-id-0 output e2e). Allocate
-    # `input_quant` as fresh storage so the gemm2 input is stable.
-    input_quant = torch.zeros(
+    # the per-MoE-call output buffer to the same storage, so viewing
+    # `quant_output` (== workspace13) as `input_quant` makes the gemm2 input
+    # alias the gemm2 destination. Allocate `input_quant` as fresh storage.
+    input_quant = torch.empty(
         input_tensor.shape,
         dtype=torch.float8_e4m3fn,
         device=input_tensor.device,
     )
-    # `mxfp8_experts_quant` only fills the rows that fall within
-    # `problem_sizes[e][0]` for each expert; left-over bytes in unused tail
-    # rows can decode to FP8 NaN or E8M0 inf and propagate NaN through the
-    # gemm2 accumulator, so zero-init the activation and scale buffers first.
-    input_scale = torch.zeros(
+    input_scale = torch.empty(
         (scale_rows, k // MXFP8_BLOCK_SIZE),
         dtype=torch.uint8,
         device=input_tensor.device,
@@ -439,12 +430,6 @@ def run_cutlass_batched_moe_mxfp8(
     # gemm1 can consume DeepEP-dispatched MXFP8 activations; gemm2's input is
     # produced locally by the activation kernel, so it is always quantized here.
     gemm1_out = _resize_cache(workspace13, (num_experts * max_num_tokens, gemm1_n))
-    # CUTLASS only writes the first `expert_num_tokens[e]` rows per expert, and
-    # `apply_moe_activation` runs over every row. Without zeroing, unused tail
-    # rows in `gemm1_out` carry uninitialized data (potentially NaN bit
-    # patterns) which `silu` propagates through `act_out` and then the gemm2
-    # quantization, ultimately reaching the combined output as NaN.
-    gemm1_out.zero_()
     ops.cutlass_mxfp8_grouped_mm(
         a1q,
         w1,
@@ -479,12 +464,6 @@ def run_cutlass_batched_moe_mxfp8(
         workspace13,
     )
 
-    # Zero gemm2's destination so unused per-expert rows do not retain
-    # uninitialized bytes; the DeepEP combine kernel reads only the rows that
-    # the dispatch layout recorded, but stale workspace contents from prior
-    # iterations have been observed propagating NaN into the combined output
-    # when topk and m grow.
-    output.zero_()
     ops.cutlass_mxfp8_grouped_mm(
         a2q,
         w2,

@@ -568,13 +568,23 @@ def _deep_ep_mxfp8_moe(
             experts_cls=CutlassBatchedExpertsMxfp8,
         )
 
+    # Always catch NaN/Inf from the before-fix workspace-aliasing regression
+    # explicitly, independent of the per-case tolerance: a wide atol could
+    # otherwise let finite-but-corrupt outputs slip through silently.
+    assert torch.isfinite(deepep_combined).all(), (
+        "deepep_combined contains NaN/Inf"
+    )
+
     if use_mxfp8_dispatch:
-        # Native MXFP8 dispatch quantizes activations before the all-to-all, so
-        # it has additional quantization error versus BF16 dispatch.
+        # Native MXFP8 dispatch quantizes activations before the all-to-all,
+        # so it has additional quantization error versus BF16 dispatch. Only
+        # the high-topk cases need the wider envelope; keep the original
+        # tolerance everywhere else so the regression guard stays sharp.
+        atol = 5e-1 if config.topk >= 8 else 2.5e-1
         torch.testing.assert_close(
             torch_combined,
             deepep_combined,
-            atol=5e-1,
+            atol=atol,
             rtol=2e-1,
         )
     else:
@@ -703,19 +713,29 @@ def test_low_latency_deep_ep_moe(
     )
 
 
+_MXFP8_MOE_CASES = [
+    (1, 1),
+    (3, 2),
+    (MAX_TOKENS_PER_RANK, 1),
+    (16, 8),
+    (MAX_TOKENS_PER_RANK, 8),
+]
+
+
 @pytest.mark.skipif(
     not is_sm100_supported(),
     reason="MXFP8 CUTLASS batched experts require CUDA SM100",
 )
+@pytest.mark.parametrize("m,topk", _MXFP8_MOE_CASES)
 @multi_gpu_test(num_gpus=2)
 @requires_deep_ep
-def test_low_latency_deep_ep_mxfp8_moe(workspace_init):
+def test_low_latency_deep_ep_mxfp8_moe(m: int, topk: int, workspace_init):
     set_random_seed(7)
     world_size, dp_size = (2, 1)
     config = TestConfig(
         dtype=torch.bfloat16,
-        topk=1,
-        m=1,
+        topk=topk,
+        m=m,
         k=2560,
         n=128,
         num_experts=32,
@@ -745,16 +765,7 @@ def test_low_latency_deep_ep_mxfp8_moe(workspace_init):
     not is_sm100_supported(),
     reason="MXFP8 CUTLASS batched experts require CUDA SM100",
 )
-@pytest.mark.parametrize(
-    "m,topk",
-    [
-        (1, 1),
-        (3, 2),
-        (MAX_TOKENS_PER_RANK, 1),
-        (16, 8),
-        (MAX_TOKENS_PER_RANK, 8),
-    ],
-)
+@pytest.mark.parametrize("m,topk", _MXFP8_MOE_CASES)
 @multi_gpu_test(num_gpus=2)
 @requires_deep_ep
 def test_low_latency_deep_ep_mxfp8_native_dispatch_moe(
