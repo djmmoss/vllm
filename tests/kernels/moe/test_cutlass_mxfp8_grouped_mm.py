@@ -10,9 +10,9 @@ import random
 import pytest
 import torch
 
-from tests.kernels.moe.utils import is_sm100_supported
 from tests.kernels.utils import torch_moe_single
 from vllm import _custom_ops as ops
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
 random.seed(42)
@@ -29,6 +29,12 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
+
+
+def is_sm100_supported() -> bool:
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        100
+    )
 
 
 def compute_ref_output(
