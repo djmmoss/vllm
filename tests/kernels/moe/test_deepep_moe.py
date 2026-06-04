@@ -11,10 +11,7 @@ import pytest
 import torch.distributed
 from torch.distributed import ProcessGroup
 
-from tests.kernels.moe.utils import (
-    is_sm100_supported,
-    make_dummy_moe_config,
-)
+from tests.kernels.moe.utils import make_dummy_moe_config
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -38,6 +35,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     mxfp8_e4m3_quantize,
 )
+from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_deep_ep
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -732,7 +730,7 @@ _MXFP8_MOE_CASES = [
 
 
 @pytest.mark.skipif(
-    not is_sm100_supported(),
+    not current_platform.is_device_capability_family(100),
     reason="MXFP8 FlashInfer CuteDSL batched experts require CUDA SM100",
 )
 @pytest.mark.parametrize("m,topk", _MXFP8_MOE_CASES)
@@ -771,7 +769,7 @@ def test_low_latency_deep_ep_mxfp8_moe(m: int, topk: int, workspace_init):
 
 
 @pytest.mark.skipif(
-    not is_sm100_supported(),
+    not current_platform.is_device_capability_family(100),
     reason="MXFP8 FlashInfer CuteDSL batched experts require CUDA SM100",
 )
 @pytest.mark.parametrize("m,topk", _MXFP8_MOE_CASES)

@@ -36,15 +36,8 @@ from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
 )
-from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import per_block_cast_to_fp8
 from vllm.utils.math_utils import round_up
-
-
-def is_sm100_supported() -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability_family(
-        100
-    )
 
 
 def quantize_expert_rows_mxfp8(
