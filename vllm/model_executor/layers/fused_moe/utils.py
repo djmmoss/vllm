@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import contextlib
 import functools
-import os
 from math import prod
 
 import torch
@@ -36,12 +34,6 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import is_torch_equal_or_newer
-
-
-def mxfp8_moe_nvtx_range(name: str):
-    if os.getenv("VLLM_MXFP8_MOE_NVTX", "0") != "1":
-        return contextlib.nullcontext()
-    return torch.cuda.nvtx.range(name)
 
 
 @triton.jit

@@ -25,10 +25,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
-from vllm.model_executor.layers.fused_moe.utils import (
-    _resize_cache,
-    mxfp8_moe_nvtx_range,
-)
+from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     swizzle_mxfp8_scales_batched_for_cute,
@@ -282,36 +279,32 @@ def _quantize_act_for_cute(
     """
     assert act_out.dim() == 2
     assert act_out.size(0) == num_experts * max_num_tokens
-    with mxfp8_moe_nvtx_range("mxfp8_moe:a2_quant_problem_data"):
-        problem_sizes, expert_offsets, blockscale_offsets, scale_rows = (
-            _make_batched_problem_data(
-                expert_num_tokens, max_num_tokens, n=n_out, k=n_out
-            )
+    problem_sizes, expert_offsets, blockscale_offsets, scale_rows = (
+        _make_batched_problem_data(
+            expert_num_tokens, max_num_tokens, n=n_out, k=n_out
         )
-    with mxfp8_moe_nvtx_range("mxfp8_moe:a2_quant_alloc_zero"):
-        fp8 = torch.zeros(
-            (num_experts * max_num_tokens, n_out),
-            dtype=torch.float8_e4m3fn,
-            device=act_out.device,
-        )
-        sf_rm = torch.zeros(
-            (scale_rows, n_out // MXFP8_BLOCK_SIZE),
-            dtype=torch.uint8,
-            device=act_out.device,
-        )
-    with mxfp8_moe_nvtx_range("mxfp8_moe:a2_quant_kernel"):
-        ops.mxfp8_experts_quant(
-            act_out, problem_sizes, expert_offsets, blockscale_offsets, fp8, sf_rm
-        )
+    )
+    fp8 = torch.zeros(
+        (num_experts * max_num_tokens, n_out),
+        dtype=torch.float8_e4m3fn,
+        device=act_out.device,
+    )
+    sf_rm = torch.zeros(
+        (scale_rows, n_out // MXFP8_BLOCK_SIZE),
+        dtype=torch.uint8,
+        device=act_out.device,
+    )
+    ops.mxfp8_experts_quant(
+        act_out, problem_sizes, expert_offsets, blockscale_offsets, fp8, sf_rm
+    )
     # ``mxfp8_experts_quant`` writes scale factors in the Cute/CUTLASS swizzled
     # layout already. Zero past-mask SF bytes in that layout: the grouped GEMM
     # can TMA-read a whole scale tile even when masked_m is smaller.
     scale_stride = scale_rows // num_experts
-    with mxfp8_moe_nvtx_range("mxfp8_moe:a2_quant_zero_past_sf"):
-        _zero_invalid_swizzled_scale_rows(
-            sf_rm.view(num_experts, scale_stride, n_out // MXFP8_BLOCK_SIZE),
-            expert_num_tokens,
-        )
+    _zero_invalid_swizzled_scale_rows(
+        sf_rm.view(num_experts, scale_stride, n_out // MXFP8_BLOCK_SIZE),
+        expert_num_tokens,
+    )
     return fp8, sf_rm.view(num_experts, -1).view(torch.float8_e8m0fnu)
 
 
@@ -468,75 +461,61 @@ class FlashInferCuteDSLBatchedExpertsMxfp8(mk.FusedMoEExpertsModular):
             # The cute masked GEMM may read FP8 payload rows beyond masked_m
             # while forming tiles. Keep those rows finite without allocating a
             # full torch.where copy of the dispatch buffer.
-            with mxfp8_moe_nvtx_range("mxfp8_moe:a1_zero_past_fp8"):
-                _zero_invalid_rows(
-                    hidden_states, expert_tokens_meta.expert_num_tokens
-                )
+            _zero_invalid_rows(hidden_states, expert_tokens_meta.expert_num_tokens)
             a1_fp8 = hidden_states
             # Sanitize beyond-mask scale rows from the DeepEP recv buffer. The
             # cute masked GEMM can see stale TMA-pushed scale data past
             # ``masked_m``; CUTLASS avoids this through per-expert problem
             # sizes that bound both reads and writes.
-            with mxfp8_moe_nvtx_range("mxfp8_moe:a1_zero_past_sf"):
-                _zero_invalid_scale_rows(
-                    a1q_scale, expert_tokens_meta.expert_num_tokens
-                )
-            with mxfp8_moe_nvtx_range("mxfp8_moe:a1_swizzle_sf"):
-                a1_sf_cute = swizzle_mxfp8_scales_batched_for_cute(
-                    a1q_scale, E, scale_stride, K
-                ).view(torch.float8_e8m0fnu)
+            _zero_invalid_scale_rows(a1q_scale, expert_tokens_meta.expert_num_tokens)
+            a1_sf_cute = swizzle_mxfp8_scales_batched_for_cute(
+                a1q_scale, E, scale_stride, K
+            ).view(torch.float8_e8m0fnu)
         else:
             assert hidden_states.dtype in (torch.float16, torch.bfloat16)
-            with mxfp8_moe_nvtx_range("mxfp8_moe:a1_quantize_for_cute"):
-                a1_fp8, a1_sf_cute = _quantize_act_for_cute(
-                    hidden_states.view(-1, K),
-                    expert_tokens_meta.expert_num_tokens,
-                    E,
-                    M_max,
-                    K,
-                )
-            a1_fp8 = a1_fp8.view(E, M_max, K)
-
-        with mxfp8_moe_nvtx_range("mxfp8_moe:workspace_resize"):
-            gemm1_out = _resize_cache(workspace13, (E, M_max, N2))
-        with mxfp8_moe_nvtx_range("mxfp8_moe:gemm1"):
-            flashinfer_cutedsl_grouped_gemm_nt_masked(
-                (a1_fp8.permute(1, 2, 0), a1_sf_cute),
-                (w1.permute(1, 2, 0), self.w1_scale.view(torch.float8_e8m0fnu)),
-                gemm1_out.permute(1, 2, 0),
-                expert_tokens_meta.expert_num_tokens,
-                ab_dtype="float8_e4m3fn",
-                sf_dtype="float8_e8m0fnu",
-                c_dtype="bfloat16",
-                sf_vec_size=MXFP8_BLOCK_SIZE,
-            )
-        # The activation kernel reads the full workspace row range. Keep only
-        # invalid GEMM1 rows finite instead of pre-zeroing the whole workspace.
-        with mxfp8_moe_nvtx_range("mxfp8_moe:gemm1_zero_past_rows"):
-            _zero_invalid_rows(gemm1_out, expert_tokens_meta.expert_num_tokens)
-
-        act_out = _resize_cache(workspace2, (E * M_max, N))
-        with mxfp8_moe_nvtx_range("mxfp8_moe:activation"):
-            apply_moe_activation(activation, act_out, gemm1_out.view(E * M_max, N2))
-
-        with mxfp8_moe_nvtx_range("mxfp8_moe:a2_quantize_for_cute"):
-            a2_fp8, a2_sf_cute = _quantize_act_for_cute(
-                act_out,
+            a1_fp8, a1_sf_cute = _quantize_act_for_cute(
+                hidden_states.view(-1, K),
                 expert_tokens_meta.expert_num_tokens,
                 E,
                 M_max,
-                N,
+                K,
             )
+            a1_fp8 = a1_fp8.view(E, M_max, K)
+
+        gemm1_out = _resize_cache(workspace13, (E, M_max, N2))
+        flashinfer_cutedsl_grouped_gemm_nt_masked(
+            (a1_fp8.permute(1, 2, 0), a1_sf_cute),
+            (w1.permute(1, 2, 0), self.w1_scale.view(torch.float8_e8m0fnu)),
+            gemm1_out.permute(1, 2, 0),
+            expert_tokens_meta.expert_num_tokens,
+            ab_dtype="float8_e4m3fn",
+            sf_dtype="float8_e8m0fnu",
+            c_dtype="bfloat16",
+            sf_vec_size=MXFP8_BLOCK_SIZE,
+        )
+        # The activation kernel reads the full workspace row range. Keep only
+        # invalid GEMM1 rows finite instead of pre-zeroing the whole workspace.
+        _zero_invalid_rows(gemm1_out, expert_tokens_meta.expert_num_tokens)
+
+        act_out = _resize_cache(workspace2, (E * M_max, N))
+        apply_moe_activation(activation, act_out, gemm1_out.view(E * M_max, N2))
+
+        a2_fp8, a2_sf_cute = _quantize_act_for_cute(
+            act_out,
+            expert_tokens_meta.expert_num_tokens,
+            E,
+            M_max,
+            N,
+        )
         a2_fp8 = a2_fp8.view(E, M_max, N)
 
-        with mxfp8_moe_nvtx_range("mxfp8_moe:gemm2"):
-            flashinfer_cutedsl_grouped_gemm_nt_masked(
-                (a2_fp8.permute(1, 2, 0), a2_sf_cute),
-                (w2.permute(1, 2, 0), self.w2_scale.view(torch.float8_e8m0fnu)),
-                output.permute(1, 2, 0),
-                expert_tokens_meta.expert_num_tokens,
-                ab_dtype="float8_e4m3fn",
-                sf_dtype="float8_e8m0fnu",
-                c_dtype="bfloat16",
-                sf_vec_size=MXFP8_BLOCK_SIZE,
-            )
+        flashinfer_cutedsl_grouped_gemm_nt_masked(
+            (a2_fp8.permute(1, 2, 0), a2_sf_cute),
+            (w2.permute(1, 2, 0), self.w2_scale.view(torch.float8_e8m0fnu)),
+            output.permute(1, 2, 0),
+            expert_tokens_meta.expert_num_tokens,
+            ab_dtype="float8_e4m3fn",
+            sf_dtype="float8_e8m0fnu",
+            c_dtype="bfloat16",
+            sf_vec_size=MXFP8_BLOCK_SIZE,
+        )
