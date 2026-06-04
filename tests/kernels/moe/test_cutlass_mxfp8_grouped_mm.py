@@ -6,39 +6,21 @@
 """Tests for SM100 CUTLASS MXFP8 grouped MoE kernels."""
 
 import random
-from types import SimpleNamespace
 
 import pytest
 import torch
 
-from tests.kernels.moe.utils import (
-    is_sm100_supported,
-)
 from tests.kernels.utils import torch_moe_single
 from vllm import _custom_ops as ops
-from vllm.model_executor.layers.fused_moe.activation import (
-    MoEActivation,
-    apply_moe_activation,
-)
-from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
-    _format_deepep_mxfp8_scales_for_cutlass,
-    _make_batched_mxfp8_problem_data,
-    run_cutlass_batched_moe_mxfp8,
-)
-from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
-    Fp8MoeBackend,
-    convert_to_fp8_moe_kernel_format,
-)
-from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-    MXFP8_BLOCK_SIZE,
-    mxfp8_e4m3_quantize,
-    swizzle_mxfp8_scale,
-)
-from vllm.utils.math_utils import round_up
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
 random.seed(42)
 set_random_seed(42)
+
+
+def align(val: int, alignment: int = 128) -> int:
+    return int((val + alignment - 1) // alignment * alignment)
 
 
 # Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
@@ -47,6 +29,12 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
+
+
+def is_sm100_supported() -> bool:
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        100
+    )
 
 
 def compute_ref_output(
@@ -109,18 +97,14 @@ def compute_kernel_output(
         input_tensor, dtype=torch.float8_e4m3fn, device=device
     )
     input_scale_factor = torch.zeros(
-        (input_blockscale_offset, k_g // MXFP8_BLOCK_SIZE),
-        dtype=torch.uint8,
-        device=device,
+        (input_blockscale_offset, k_g // 32), dtype=torch.uint8, device=device
     )
 
     weight_quant = torch.zeros_like(
         weight_tensor, dtype=torch.float8_e4m3fn, device=device
     )
     weight_scale_factor = torch.zeros(
-        (num_experts, n_g, k_g // MXFP8_BLOCK_SIZE),
-        dtype=torch.uint8,
-        device=device,
+        (num_experts, n_g, k_g // 32), dtype=torch.uint8, device=device
     )
 
     ops.mxfp8_experts_quant(
@@ -142,7 +126,7 @@ def compute_kernel_output(
     )
     weight_quant = weight_quant.view(num_experts, n_g, k_g).transpose(1, 2)
     weight_scale_factor = weight_scale_factor.view(
-        num_experts, n_g, k_g // MXFP8_BLOCK_SIZE
+        num_experts, n_g, k_g // 32
     ).transpose(1, 2)
 
     output = torch.empty((expert_offset, n_g), device=device, dtype=out_dtype)
@@ -157,136 +141,6 @@ def compute_kernel_output(
         _input_blockscale_offsets,
     )
     return output
-
-
-def test_make_batched_mxfp8_problem_data():
-    expert_num_tokens = torch.tensor([3, 0, 129], dtype=torch.int64)
-    problem_sizes, expert_offsets, blockscale_offsets, scale_rows = (
-        _make_batched_mxfp8_problem_data(
-            expert_num_tokens=expert_num_tokens,
-            max_num_tokens=160,
-            n=256,
-            k=128,
-        )
-    )
-
-    assert problem_sizes.tolist() == [
-        [3, 256, 128],
-        [0, 256, 128],
-        [129, 256, 128],
-    ]
-    assert expert_offsets.tolist() == [0, 160, 320]
-    assert blockscale_offsets.tolist() == [0, 256, 512]
-    assert scale_rows == 768
-
-
-def test_format_deepep_mxfp8_scales_for_cutlass():
-    act_scales = torch.arange(2 * 128 * 16, dtype=torch.uint8).view(2, 128, 16)
-
-    formatted = _format_deepep_mxfp8_scales_for_cutlass(
-        act_scales,
-        max_num_tokens=64,
-        hidden_dim=512,
-        scale_rows=256,
-    )
-
-    assert formatted.shape == (256, 16)
-    expected = torch.stack(
-        [
-            swizzle_mxfp8_scale(act_scales[e], M=128, K=512)
-            for e in range(act_scales.size(0))
-        ],
-        dim=0,
-    ).view(256, 16)
-    assert torch.equal(formatted, expected)
-
-    act_scales = torch.arange(2 * 256 * 16, dtype=torch.uint8).view(2, 256, 16)
-    formatted = _format_deepep_mxfp8_scales_for_cutlass(
-        act_scales,
-        max_num_tokens=129,
-        hidden_dim=512,
-        scale_rows=512,
-    )
-    assert formatted.shape == (512, 16)
-    expected = torch.stack(
-        [
-            swizzle_mxfp8_scale(act_scales[e], M=256, K=512)
-            for e in range(act_scales.size(0))
-        ],
-        dim=0,
-    ).view(512, 16)
-    assert torch.equal(formatted, expected)
-
-    with pytest.raises(AssertionError):
-        _format_deepep_mxfp8_scales_for_cutlass(
-            act_scales[:, :128],
-            max_num_tokens=129,
-            hidden_dim=512,
-            scale_rows=512,
-        )
-
-    with pytest.raises(AssertionError):
-        _format_deepep_mxfp8_scales_for_cutlass(
-            torch.empty(2, 256, 32, dtype=torch.uint8)[:, :, ::2],
-            max_num_tokens=129,
-            hidden_dim=512,
-            scale_rows=512,
-        )
-
-
-def test_convert_batched_cutlass_mxfp8_kernel_format():
-    num_experts = 2
-    hidden_size = 128
-    intermediate_size = 128
-    w13_rows = 2 * intermediate_size
-    layer = SimpleNamespace(weight_block_size=[1, MXFP8_BLOCK_SIZE])
-
-    w13 = torch.empty(num_experts, w13_rows, hidden_size, dtype=torch.float8_e4m3fn)
-    w2 = torch.empty(
-        num_experts, hidden_size, intermediate_size, dtype=torch.float8_e4m3fn
-    )
-    w13_scale = torch.arange(
-        num_experts * w13_rows * (hidden_size // MXFP8_BLOCK_SIZE), dtype=torch.uint8
-    ).view(num_experts, w13_rows, hidden_size // MXFP8_BLOCK_SIZE)
-    w2_scale = torch.arange(
-        num_experts * hidden_size * (intermediate_size // MXFP8_BLOCK_SIZE),
-        dtype=torch.uint8,
-    ).view(num_experts, hidden_size, intermediate_size // MXFP8_BLOCK_SIZE)
-
-    w13_out, w2_out, w13_scale_out, w2_scale_out = convert_to_fp8_moe_kernel_format(
-        fp8_backend=Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
-        layer=layer,
-        w13=w13,
-        w2=w2,
-        w13_scale=w13_scale,
-        w2_scale=w2_scale,
-        w13_input_scale=None,
-        w2_input_scale=None,
-    )
-
-    assert w13_out.shape == (num_experts, hidden_size, w13_rows)
-    assert w2_out.shape == (num_experts, intermediate_size, hidden_size)
-    assert w13_out.stride(1) == 1
-    assert w2_out.stride(1) == 1
-    assert w13_out.data_ptr() == w13.data_ptr()
-    assert w2_out.data_ptr() == w2.data_ptr()
-
-    expected_w13_scale = torch.stack(
-        [
-            swizzle_mxfp8_scale(w13_scale[e], M=w13_rows, K=hidden_size)
-            for e in range(num_experts)
-        ],
-        dim=0,
-    )
-    expected_w2_scale = torch.stack(
-        [
-            swizzle_mxfp8_scale(w2_scale[e], M=hidden_size, K=intermediate_size)
-            for e in range(num_experts)
-        ],
-        dim=0,
-    )
-    assert torch.equal(w13_scale_out, expected_w13_scale)
-    assert torch.equal(w2_scale_out, expected_w2_scale)
 
 
 @pytest.mark.skipif(
@@ -324,7 +178,7 @@ def test_cutlass_mxfp8_grouped_mm(num_experts, out_dtype):
         aux_expert_offsets.append(aux_expert_offset)
         aux_expert_offset += n_g
         input_blockscale_offsets.append(input_blockscale_offset)
-        input_blockscale_offset += round_up(m_g, 128)
+        input_blockscale_offset += align(m_g, 128)
         weight_blockscale_offsets.append(weight_blockscale_offset)
         weight_blockscale_offset += n_g  # n_g already align to 128
         problem_sizes.append([m_g, n_g, k_g])
@@ -377,117 +231,6 @@ def test_cutlass_mxfp8_grouped_mm(num_experts, out_dtype):
             f"m_g={baseline.shape[0]} n_g={n_g} k_g={k_g} num_experts={num_experts}, "
             f"out_dtype={out_dtype}, diff={diff:.5f}: OK"
         )
-
-
-@pytest.mark.skipif(
-    not is_sm100_supported(),
-    reason=(
-        "cutlass_mxfp8_grouped_mm and mxfp8_experts_quant "
-        "are only supported on CUDA SM100"
-    ),
-)
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.half])
-def test_cutlass_batched_mxfp8_experts(out_dtype):
-    device = "cuda"
-    num_experts = 4
-    max_tokens = 17
-    hidden_size = 128
-    intermediate_size = 128
-    activation = MoEActivation.SILU
-    w13_rows = 2 * intermediate_size
-
-    hidden_states = (
-        torch.randn(
-            num_experts,
-            max_tokens,
-            hidden_size,
-            device=device,
-            dtype=out_dtype,
-        )
-        / 20
-    )
-    w13 = (
-        torch.randn(
-            num_experts,
-            w13_rows,
-            hidden_size,
-            device=device,
-            dtype=out_dtype,
-        )
-        / 20
-    )
-    w2 = (
-        torch.randn(
-            num_experts,
-            hidden_size,
-            intermediate_size,
-            device=device,
-            dtype=out_dtype,
-        )
-        / 20
-    )
-
-    w13_quantized = [
-        mxfp8_e4m3_quantize(w13[e], is_sf_swizzled_layout=False)
-        for e in range(num_experts)
-    ]
-    w2_quantized = [
-        mxfp8_e4m3_quantize(w2[e], is_sf_swizzled_layout=False)
-        for e in range(num_experts)
-    ]
-    w13_q = torch.stack([q for q, _ in w13_quantized], dim=0)
-    w13_scale = torch.stack([scale for _, scale in w13_quantized], dim=0)
-    w2_q = torch.stack([q for q, _ in w2_quantized], dim=0)
-    w2_scale = torch.stack([scale for _, scale in w2_quantized], dim=0)
-
-    layer = SimpleNamespace(weight_block_size=[1, MXFP8_BLOCK_SIZE])
-    w13_q, w2_q, w13_scale, w2_scale = convert_to_fp8_moe_kernel_format(
-        fp8_backend=Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
-        layer=layer,
-        w13=w13_q,
-        w2=w2_q,
-        w13_scale=w13_scale,
-        w2_scale=w2_scale,
-        w13_input_scale=None,
-        w2_input_scale=None,
-    )
-
-    output = torch.empty_like(hidden_states)
-    workspace13 = torch.empty(
-        num_experts, max_tokens, w13_rows, device=device, dtype=out_dtype
-    )
-    workspace2 = torch.empty(
-        num_experts, max_tokens, hidden_size, device=device, dtype=out_dtype
-    )
-    expert_num_tokens = torch.tensor([3, 17, 0, 8], dtype=torch.int32, device=device)
-
-    run_cutlass_batched_moe_mxfp8(
-        output=output,
-        hidden_states=hidden_states,
-        w1=w13_q,
-        w2=w2_q,
-        w1_scale=w13_scale,
-        w2_scale=w2_scale,
-        expert_num_tokens=expert_num_tokens,
-        activation=activation,
-        workspace13=workspace13,
-        workspace2=workspace2,
-    )
-
-    ref = torch.empty_like(output)
-    act_out = torch.empty(max_tokens, intermediate_size, device=device, dtype=out_dtype)
-    for expert, num_tokens in enumerate(expert_num_tokens.tolist()):
-        if num_tokens == 0:
-            continue
-        mm1 = hidden_states[expert, :num_tokens] @ w13[expert].transpose(0, 1)
-        apply_moe_activation(activation, act_out[:num_tokens], mm1)
-        ref[expert, :num_tokens] = act_out[:num_tokens] @ w2[expert].transpose(0, 1)
-
-    for expert, num_tokens in enumerate(expert_num_tokens.tolist()):
-        if num_tokens == 0:
-            continue
-        diff = calc_diff(output[expert, :num_tokens], ref[expert, :num_tokens])
-        assert diff < 0.05
 
 
 if __name__ == "__main__":
