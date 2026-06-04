@@ -123,6 +123,16 @@ def _sync_visible_devices_env_vars():
     _sync_hip_cuda_env_vars()
 
 
+def sanitize_spawn_sys_path():
+    """Remove package-internal paths that can shadow stdlib modules in spawn."""
+
+    sys.path[:] = [
+        path
+        for path in sys.path
+        if os.path.basename(os.path.normpath(path)) != "cv2"
+    ]
+
+
 def _maybe_force_spawn():
     """Check if we need to force the use of the `spawn` multiprocessing start
     method.
@@ -177,6 +187,7 @@ def get_mp_context():
     # consistent values. Must run after _maybe_force_spawn and regardless
     # of whether spawn was already set.
     _sync_visible_devices_env_vars()
+    sanitize_spawn_sys_path()
     mp_method = envs.VLLM_WORKER_MULTIPROC_METHOD
     return multiprocessing.get_context(mp_method)
 

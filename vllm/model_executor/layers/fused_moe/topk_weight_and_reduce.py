@@ -24,8 +24,19 @@ class TopKWeightAndReduceDelegate(mk.TopKWeightAndReduce):
     weight + reduce.
     """
 
+    def __init__(self, sync_before_low_latency_combine: bool = False):
+        self.sync_before_low_latency_combine = sync_before_low_latency_combine
+
     def __eq__(self, other):
-        return isinstance(other, TopKWeightAndReduceDelegate)
+        return (
+            isinstance(other, TopKWeightAndReduceDelegate)
+            and self.sync_before_low_latency_combine
+            == other.sync_before_low_latency_combine
+        )
+
+    def should_sync_before_low_latency_combine(self) -> bool:
+        return self.sync_before_low_latency_combine
+
 
     def apply(
         self,

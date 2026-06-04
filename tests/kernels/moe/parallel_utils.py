@@ -6,6 +6,7 @@ DeepEP test utilities
 
 import dataclasses
 import os
+import sys
 import traceback
 from collections.abc import Callable
 from typing import Concatenate
@@ -92,19 +93,29 @@ def parallel_launch(
     **kwargs: P.kwargs,
 ) -> None:
     assert not kwargs
-    spawn(
-        _worker_parallel_launch,
-        args=(
-            world_size,
-            world_size,
-            0,
-            f"tcp://{os.getenv('LOCALHOST', 'localhost')}:{get_open_port()}",
-            worker,
+    # OpenCV's loader can leave `site-packages/cv2` on sys.path. Spawned rank
+    # interpreters inherit sys.path and may then resolve stdlib `typing` to
+    # `cv2/typing`, failing before test code runs.
+    original_sys_path = sys.path[:]
+    sys.path[:] = [
+        p for p in sys.path if os.path.basename(os.path.normpath(p)) != "cv2"
+    ]
+    try:
+        spawn(
+            _worker_parallel_launch,
+            args=(
+                world_size,
+                world_size,
+                0,
+                f"tcp://{os.getenv('LOCALHOST', 'localhost')}:{get_open_port()}",
+                worker,
+            )
+            + args,
+            nprocs=world_size,
+            join=True,
         )
-        + args,
-        nprocs=world_size,
-        join=True,
-    )
+    finally:
+        sys.path[:] = original_sys_path
 
 
 ## DeepEP specific utils

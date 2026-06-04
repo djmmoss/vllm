@@ -32,6 +32,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     swizzle_mxfp8_scale,
+    swizzle_mxfp8_scales_batched_for_cute,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -47,6 +48,7 @@ class Fp8MoeBackend(Enum):
     NONE = "NONE"
     FLASHINFER_TRTLLM = "FLASHINFER_TRTLLM"
     FLASHINFER_CUTLASS = "FLASHINFER_CUTLASS"
+    BATCHED_FLASHINFER_MXFP8 = "BATCHED_FLASHINFER_MXFP8"
     DEEPGEMM = "DEEPGEMM"
     BATCHED_DEEPGEMM = "BATCHED_DEEPGEMM"
     MARLIN = "MARLIN"
@@ -186,6 +188,13 @@ def backend_to_kernel_cls(
         )
 
         return [CutlassBatchedExpertsMxfp8, CutlassBatchedExpertsFp8]
+
+    elif backend == Fp8MoeBackend.BATCHED_FLASHINFER_MXFP8:
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_batched_mxfp8_moe import (  # noqa: E501
+            FlashInferCuteDSLBatchedExpertsMxfp8,
+        )
+
+        return [FlashInferCuteDSLBatchedExpertsMxfp8]
 
     elif backend == Fp8MoeBackend.XPU:
         from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
@@ -518,6 +527,24 @@ def convert_to_fp8_moe_kernel_format(
         )
         w13 = w13.transpose(1, 2)
         w2 = w2.transpose(1, 2)
+    elif fp8_backend == Fp8MoeBackend.BATCHED_FLASHINFER_MXFP8:
+        assert getattr(layer, "weight_block_size", None) == [1, MXFP8_BLOCK_SIZE]
+        # Swizzle weight scales to FlashInfer cute layout.
+        # w13_scale: (E, 2N, K // 32) row-major; w2_scale: (E, K, N // 32).
+        e, two_n, k = w13.shape
+        w13_scale = swizzle_mxfp8_scales_batched_for_cute(
+            w13_scale.contiguous().view(e, two_n, k // MXFP8_BLOCK_SIZE),
+            e,
+            two_n,
+            k,
+        )
+        e2, k2, n2 = w2.shape
+        w2_scale = swizzle_mxfp8_scales_batched_for_cute(
+            w2_scale.contiguous().view(e2, k2, n2 // MXFP8_BLOCK_SIZE),
+            e2,
+            k2,
+            n2,
+        )
     else:
         if fp8_backend not in [
             Fp8MoeBackend.TRITON,

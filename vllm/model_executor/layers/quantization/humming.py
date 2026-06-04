@@ -45,23 +45,30 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
-if current_platform.is_cuda():
-    from humming.dtypes import DataType
-    from humming.layer import HummingMethod
-    from humming.schema import (
-        BaseInputSchema,
-        BaseWeightSchema,
-        HummingInputSchema,
-        HummingWeightSchema,
-    )
-    from humming.utils.weight import quantize_weight
+try:
+    _HUMMING_AVAILABLE = current_platform.is_cuda()
+    if _HUMMING_AVAILABLE:
+        from humming.dtypes import DataType
+        from humming.layer import HummingMethod
+        from humming.schema import (
+            BaseInputSchema,
+            BaseWeightSchema,
+            HummingInputSchema,
+            HummingWeightSchema,
+        )
+        from humming.utils.weight import quantize_weight
 
-    from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
-        BatchedHummingGroupedExperts,
-        HummingGroupedExperts,
-        HummingIndexedExperts,
-        get_humming_moe_gemm_type,
-    )
+        from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+            BatchedHummingGroupedExperts,
+            HummingGroupedExperts,
+            HummingIndexedExperts,
+            get_humming_moe_gemm_type,
+        )
+except ImportError:
+    # The internal `humming` package may not be installed in this environment.
+    # Allow vLLM to import the quantization registry without it; HummingConfig
+    # will raise if a model actually requires this backend.
+    _HUMMING_AVAILABLE = False
 
 if TYPE_CHECKING:
     from humming.schema import (

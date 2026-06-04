@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
 from vllm.model_executor.layers.fused_moe.utils import (
+    mxfp8_moe_nvtx_range,
     moe_kernel_quantize_input,
     normalize_batched_scales_shape,
 )
@@ -333,35 +334,36 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             )
             a1 = a1 * topk_weights.to(a1.dtype)
 
-        # Dispatch
-        dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)
-        use_e8m0_dispatch_scales = (
-            self.use_packed_ue8m0_dispatch or self.use_mxfp8_dispatch
-        )
-        (
-            expert_x,
-            expert_num_tokens,
-            handle,
-            _,
-            hook,
-        ) = self.buffer.low_latency_dispatch(
-            a1,
-            dispatch_topk_ids,
-            self.max_tokens_per_rank,
-            num_experts,
-            use_fp8=self.use_fp8_dispatch,
-            round_scale=use_e8m0_dispatch_scales,
-            use_ue8m0=use_e8m0_dispatch_scales,
-            **(dict(use_mxfp8=True) if self.use_mxfp8_dispatch else dict()),
-            **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
-            **(
-                dict(x_global_scale=qc_a1_gscale_or_scale)
-                if qc_a1_gscale_or_scale is not None and nvfp4_dispatch
-                else dict()
-            ),
-            async_finish=False,
-            return_recv_hook=True,
-        )
+        with mxfp8_moe_nvtx_range("mxfp8_moe:deepep_dispatch_prepare"):
+            dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)
+            use_e8m0_dispatch_scales = (
+                self.use_packed_ue8m0_dispatch or self.use_mxfp8_dispatch
+            )
+        with mxfp8_moe_nvtx_range("mxfp8_moe:deepep_dispatch"):
+            (
+                expert_x,
+                expert_num_tokens,
+                handle,
+                _,
+                hook,
+            ) = self.buffer.low_latency_dispatch(
+                a1,
+                dispatch_topk_ids,
+                self.max_tokens_per_rank,
+                num_experts,
+                use_fp8=self.use_fp8_dispatch,
+                round_scale=use_e8m0_dispatch_scales,
+                use_ue8m0=use_e8m0_dispatch_scales,
+                **(dict(use_mxfp8=True) if self.use_mxfp8_dispatch else dict()),
+                **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
+                **(
+                    dict(x_global_scale=qc_a1_gscale_or_scale)
+                    if qc_a1_gscale_or_scale is not None and nvfp4_dispatch
+                    else dict()
+                ),
+                async_finish=False,
+                return_recv_hook=True,
+            )
         self.handles[a2a_idx] = handle
 
         return (
@@ -389,11 +391,15 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             assert isinstance(expert_x, torch.Tensor)
             expert_x_scale = None
         else:
-            expert_x, expert_x_scale = self._do_quant(expert_x, a1_dtype, quant_config)
+            with mxfp8_moe_nvtx_range("mxfp8_moe:deepep_receiver_quant"):
+                expert_x, expert_x_scale = self._do_quant(
+                    expert_x, a1_dtype, quant_config
+                )
 
-        expert_tokens_meta = mk.ExpertTokensMetadata(
-            expert_num_tokens=expert_num_tokens, expert_num_tokens_cpu=None
-        )
+        with mxfp8_moe_nvtx_range("mxfp8_moe:deepep_receiver_meta"):
+            expert_tokens_meta = mk.ExpertTokensMetadata(
+                expert_num_tokens=expert_num_tokens, expert_num_tokens_cpu=None
+            )
 
         return expert_x, expert_x_scale, expert_tokens_meta, None, None
 
@@ -440,24 +446,28 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         handle = self.handles[a2a_idx]
         assert handle is not None
 
-        combine_topk_weights = topk_weights
-        if apply_router_weight_on_input:
-            # weights have already been applied.
-            combine_topk_weights = torch.ones_like(topk_weights)
+        with mxfp8_moe_nvtx_range("mxfp8_moe:deepep_combine_prepare"):
+            combine_topk_weights = topk_weights
+            if apply_router_weight_on_input:
+                # weights have already been applied.
+                combine_topk_weights = torch.ones_like(topk_weights)
 
-        combine_topk_ids = self._map_global_to_physical_ids(topk_ids)
-        # TODO (varun) : Enable zero copy mode
-        dbo_maybe_run_recv_hook()
-        _, _, recv_hook = self.buffer.low_latency_combine(
-            fused_expert_output,
-            combine_topk_ids,
-            combine_topk_weights,
-            handle,
-            async_finish=False,
-            zero_copy=False,
-            return_recv_hook=do_recv_hook,
-            out=output,
-        )
+            combine_topk_ids = self._map_global_to_physical_ids(topk_ids)
+            # TODO (varun) : Enable zero copy mode
+            dbo_maybe_run_recv_hook()
+            if weight_and_reduce_impl.should_sync_before_low_latency_combine():
+                torch.cuda.current_stream(fused_expert_output.device).synchronize()
+        with mxfp8_moe_nvtx_range("mxfp8_moe:deepep_combine"):
+            _, _, recv_hook = self.buffer.low_latency_combine(
+                fused_expert_output,
+                combine_topk_ids,
+                combine_topk_weights,
+                handle,
+                async_finish=False,
+                zero_copy=False,
+                return_recv_hook=do_recv_hook,
+                out=output,
+            )
 
         return recv_hook, lambda: None
 

@@ -103,6 +103,7 @@ def make_mxfp8_weights(
     n: int,
     k: int,
     dtype: torch.dtype,
+    fp8_backend: Fp8MoeBackend = Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
@@ -124,7 +125,7 @@ def make_mxfp8_weights(
 
     layer = SimpleNamespace(weight_block_size=[1, MXFP8_BLOCK_SIZE])
     w1, w2, w1_scale, w2_scale = convert_to_fp8_moe_kernel_format(
-        fp8_backend=Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
+        fp8_backend=fp8_backend,
         layer=layer,
         w13=w1,
         w2=w2,
@@ -517,7 +518,10 @@ def _deep_ep_mxfp8_moe(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
     use_mxfp8_dispatch: bool = False,
+    experts_cls=None,
 ):
+    if experts_cls is None:
+        experts_cls = CutlassBatchedExpertsMxfp8
     device = torch.device(f"cuda:{pgi.local_rank}")
     init_workspace_manager(device)
 
@@ -565,7 +569,7 @@ def _deep_ep_mxfp8_moe(
             quant_dtype_override="mxfp8",
             block_shape=[1, MXFP8_BLOCK_SIZE],
             use_mxfp8_dispatch=use_mxfp8_dispatch,
-            experts_cls=CutlassBatchedExpertsMxfp8,
+            experts_cls=experts_cls,
         )
 
     # Always catch NaN/Inf from the before-fix workspace-aliasing regression
@@ -761,16 +765,24 @@ def test_low_latency_deep_ep_mxfp8_moe(m: int, topk: int, workspace_init):
     )
 
 
+_NATIVE_DISPATCH_EXPERTS = [
+    pytest.param("cutlass", id="cutlass"),
+    pytest.param("flashinfer_cutedsl", id="flashinfer_cutedsl"),
+]
+
+
 @pytest.mark.skipif(
     not is_sm100_supported(),
     reason="MXFP8 CUTLASS batched experts require CUDA SM100",
 )
+@pytest.mark.parametrize("experts_kind", _NATIVE_DISPATCH_EXPERTS)
 @pytest.mark.parametrize("m,topk", _MXFP8_MOE_CASES)
 @multi_gpu_test(num_gpus=2)
 @requires_deep_ep
 def test_low_latency_deep_ep_mxfp8_native_dispatch_moe(
     m: int,
     topk: int,
+    experts_kind: str,
     workspace_init,
 ):
     set_random_seed(7)
@@ -783,11 +795,23 @@ def test_low_latency_deep_ep_mxfp8_native_dispatch_moe(
         n=128,
         num_experts=32,
     )
+    if experts_kind == "cutlass":
+        experts_cls = CutlassBatchedExpertsMxfp8
+        fp8_backend = Fp8MoeBackend.BATCHED_VLLM_CUTLASS
+    else:
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_batched_mxfp8_moe import (  # noqa: E501
+            FlashInferCuteDSLBatchedExpertsMxfp8,
+        )
+
+        experts_cls = FlashInferCuteDSLBatchedExpertsMxfp8
+        fp8_backend = Fp8MoeBackend.BATCHED_FLASHINFER_MXFP8
+
     w1_ref, w2_ref, w1, w2, w1_scale, w2_scale = make_mxfp8_weights(
         config.num_experts,
         config.n,
         config.k,
         config.dtype,
+        fp8_backend=fp8_backend,
     )
 
     parallel_launch(
@@ -802,4 +826,5 @@ def test_low_latency_deep_ep_mxfp8_native_dispatch_moe(
         w1_scale,
         w2_scale,
         True,
+        experts_cls,
     )

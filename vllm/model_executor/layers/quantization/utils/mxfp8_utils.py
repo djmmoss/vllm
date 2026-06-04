@@ -35,6 +35,44 @@ def swizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
     return sf_swizzled.contiguous().view(-1)
 
 
+def swizzle_mxfp8_scales_batched_for_cute(
+    sf: torch.Tensor, num_experts: int, M: int, K: int
+) -> torch.Tensor:
+    """Swizzle batched MXFP8 scales for FlashInfer CuteDSL ``grouped_gemm_nt_masked``.
+
+    Empirically (verified against ``scaled_fp4_grouped_quantize``'s output for
+    the same kernel), the kernel reads SF as row-major contiguous over the
+    logical shape ``(l, rm, rk, 32, 4, 4)`` where ``rm = M_padded/128`` and
+    ``rk = sf_k_padded/4``. The trailing ``(32, 4, 4)`` is a per-tile block of
+    ``(m32, m4, k4)`` row-major, with ``rk`` and ``rm`` as the next-outer dims.
+
+    Input ``sf`` is row-major ``(num_experts, M, K // 32)``; pads ``M`` to a
+    multiple of 128 and ``K/32`` to a multiple of 4.
+    """
+    assert sf.dim() == 3 and sf.dtype == torch.uint8
+    sf_k = K // MXFP8_BLOCK_SIZE
+    num_m_tiles = (M + 127) // 128
+    num_k_tiles = (sf_k + 3) // 4
+
+    m_padded = num_m_tiles * 128
+    sf_k_padded = num_k_tiles * 4
+
+    sf_padded = torch.zeros(
+        (num_experts, m_padded, sf_k_padded), dtype=sf.dtype, device=sf.device
+    )
+    sf_padded[:, :M, :sf_k] = sf
+
+    # Source dims after view: (l, rm, m4, m32, rk, k4). Target (l, rm, rk, m32,
+    # m4, k4) row-major contiguous; permute (0, 1, 4, 3, 2, 5). Keep ``l`` as
+    # the leading dim so callers can slice ``[e_start:e_end]`` for EP sharding.
+    return (
+        sf_padded.view(num_experts, num_m_tiles, 4, 32, num_k_tiles, 4)
+        .permute(0, 1, 4, 3, 2, 5)
+        .contiguous()
+        .view(num_experts, -1)
+    )
+
+
 def _mxfp8_e4m3_quantize_torch(
     x: torch.Tensor,
     is_sf_swizzled_layout: bool = False,
