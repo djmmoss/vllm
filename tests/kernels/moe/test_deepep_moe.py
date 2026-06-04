@@ -18,10 +18,7 @@ from tests.kernels.moe.utils import (
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import (
-    CutlassBatchedExpertsMxfp8,
-    TritonExperts,
-)
+from vllm.model_executor.layers.fused_moe import TritonExperts
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
@@ -103,7 +100,7 @@ def make_mxfp8_weights(
     n: int,
     k: int,
     dtype: torch.dtype,
-    fp8_backend: Fp8MoeBackend = Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
+    fp8_backend: Fp8MoeBackend = Fp8MoeBackend.BATCHED_FLASHINFER_MXFP8,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
@@ -136,6 +133,14 @@ def make_mxfp8_weights(
     )
 
     return w1_ref, w2_ref, w1, w2, w1_scale, w2_scale
+
+
+def _flashinfer_cutedsl_mxfp8_experts_cls():
+    from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_batched_mxfp8_moe import (  # noqa: E501
+        FlashInferCuteDSLBatchedExpertsMxfp8,
+    )
+
+    return FlashInferCuteDSLBatchedExpertsMxfp8
 
 
 @dataclasses.dataclass
@@ -521,7 +526,7 @@ def _deep_ep_mxfp8_moe(
     experts_cls=None,
 ):
     if experts_cls is None:
-        experts_cls = CutlassBatchedExpertsMxfp8
+        experts_cls = _flashinfer_cutedsl_mxfp8_experts_cls()
     device = torch.device(f"cuda:{pgi.local_rank}")
     init_workspace_manager(device)
 
@@ -728,7 +733,7 @@ _MXFP8_MOE_CASES = [
 
 @pytest.mark.skipif(
     not is_sm100_supported(),
-    reason="MXFP8 CUTLASS batched experts require CUDA SM100",
+    reason="MXFP8 FlashInfer CuteDSL batched experts require CUDA SM100",
 )
 @pytest.mark.parametrize("m,topk", _MXFP8_MOE_CASES)
 @multi_gpu_test(num_gpus=2)
@@ -765,24 +770,16 @@ def test_low_latency_deep_ep_mxfp8_moe(m: int, topk: int, workspace_init):
     )
 
 
-_NATIVE_DISPATCH_EXPERTS = [
-    pytest.param("cutlass", id="cutlass"),
-    pytest.param("flashinfer_cutedsl", id="flashinfer_cutedsl"),
-]
-
-
 @pytest.mark.skipif(
     not is_sm100_supported(),
-    reason="MXFP8 CUTLASS batched experts require CUDA SM100",
+    reason="MXFP8 FlashInfer CuteDSL batched experts require CUDA SM100",
 )
-@pytest.mark.parametrize("experts_kind", _NATIVE_DISPATCH_EXPERTS)
 @pytest.mark.parametrize("m,topk", _MXFP8_MOE_CASES)
 @multi_gpu_test(num_gpus=2)
 @requires_deep_ep
 def test_low_latency_deep_ep_mxfp8_native_dispatch_moe(
     m: int,
     topk: int,
-    experts_kind: str,
     workspace_init,
 ):
     set_random_seed(7)
@@ -795,23 +792,13 @@ def test_low_latency_deep_ep_mxfp8_native_dispatch_moe(
         n=128,
         num_experts=32,
     )
-    if experts_kind == "cutlass":
-        experts_cls = CutlassBatchedExpertsMxfp8
-        fp8_backend = Fp8MoeBackend.BATCHED_VLLM_CUTLASS
-    else:
-        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_batched_mxfp8_moe import (  # noqa: E501
-            FlashInferCuteDSLBatchedExpertsMxfp8,
-        )
-
-        experts_cls = FlashInferCuteDSLBatchedExpertsMxfp8
-        fp8_backend = Fp8MoeBackend.BATCHED_FLASHINFER_MXFP8
+    experts_cls = _flashinfer_cutedsl_mxfp8_experts_cls()
 
     w1_ref, w2_ref, w1, w2, w1_scale, w2_scale = make_mxfp8_weights(
         config.num_experts,
         config.n,
         config.k,
         config.dtype,
-        fp8_backend=fp8_backend,
     )
 
     parallel_launch(
