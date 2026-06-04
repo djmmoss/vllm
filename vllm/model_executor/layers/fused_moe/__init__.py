@@ -91,7 +91,6 @@ if HAS_TRITON:
     )
     from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
         CutlassBatchedExpertsFp8,
-        CutlassBatchedExpertsMxfp8,
         CutlassExpertsFp8,
         CutlassExpertsW4A8Fp8,
         cutlass_moe_w4a8_fp8,
@@ -137,7 +136,6 @@ if HAS_TRITON:
         "cutlass_moe_w4a8_fp8",
         "CutlassExpertsFp8",
         "CutlassBatchedExpertsFp8",
-        "CutlassBatchedExpertsMxfp8",
         "CutlassExpertsW4A8Fp8",
         "TritonExperts",
         "TritonWNA16Experts",

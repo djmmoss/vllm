@@ -31,7 +31,6 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
-    swizzle_mxfp8_scale,
     swizzle_mxfp8_scales_batched_for_cute,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -184,10 +183,9 @@ def backend_to_kernel_cls(
     elif backend == Fp8MoeBackend.BATCHED_VLLM_CUTLASS:
         from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
             CutlassBatchedExpertsFp8,
-            CutlassBatchedExpertsMxfp8,
         )
 
-        return [CutlassBatchedExpertsMxfp8, CutlassBatchedExpertsFp8]
+        return [CutlassBatchedExpertsFp8]
 
     elif backend == Fp8MoeBackend.BATCHED_FLASHINFER_MXFP8:
         from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_batched_mxfp8_moe import (  # noqa: E501
@@ -433,19 +431,6 @@ def select_fp8_moe_backend(
     return Fp8MoeBackend.NONE, None
 
 
-def _swizzle_batched_cutlass_mxfp8_weight_scale(
-    scale: torch.Tensor,
-    n: int,
-    k: int,
-) -> torch.Tensor:
-    """Convert row-major MXFP8 weight scales to CUTLASS grouped-MM layout."""
-    num_experts = scale.size(0)
-    scale_cols = k // MXFP8_BLOCK_SIZE
-    row_major = scale.contiguous().view(num_experts, n, scale_cols)
-    swizzled = [swizzle_mxfp8_scale(row_major[e], M=n, K=k) for e in range(num_experts)]
-    return torch.stack(swizzled, dim=0).view(num_experts, -1)
-
-
 def convert_to_fp8_moe_kernel_format(
     fp8_backend: Fp8MoeBackend,
     layer: torch.nn.Module,
@@ -470,7 +455,7 @@ def convert_to_fp8_moe_kernel_format(
         w13, w2 = rocm_aiter_ops.shuffle_weights(w13, w2)
     elif fp8_backend == Fp8MoeBackend.MARLIN:
         weight_block_size = getattr(layer, "weight_block_size", None)
-        if weight_block_size == [1, MXFP8_BLOCK_SIZE]:
+        if weight_block_size == [1, 32]:
             from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
                 prepare_mxfp8_moe_layer_for_marlin,
             )
@@ -516,17 +501,6 @@ def convert_to_fp8_moe_kernel_format(
         )
 
         w13, w2 = prepare_fp8_moe_layer_for_cpu(w13, w2)
-    elif fp8_backend == Fp8MoeBackend.BATCHED_VLLM_CUTLASS and getattr(
-        layer, "weight_block_size", None
-    ) == [1, MXFP8_BLOCK_SIZE]:
-        w13_scale = _swizzle_batched_cutlass_mxfp8_weight_scale(
-            w13_scale, n=w13.size(1), k=w13.size(2)
-        )
-        w2_scale = _swizzle_batched_cutlass_mxfp8_weight_scale(
-            w2_scale, n=w2.size(1), k=w2.size(2)
-        )
-        w13 = w13.transpose(1, 2)
-        w2 = w2.transpose(1, 2)
     elif fp8_backend == Fp8MoeBackend.BATCHED_FLASHINFER_MXFP8:
         assert getattr(layer, "weight_block_size", None) == [1, MXFP8_BLOCK_SIZE]
         # Swizzle weight scales to FlashInfer cute layout.
@@ -617,7 +591,7 @@ def make_fp8_moe_quant_config(
     # _mxfp8_e4m3_quantize rather than standard FP8 block quantization.
     # Non-swizzled layout is required since the TRTLLM kernel expects
     # scales in (num_tokens, hidden_dim // 32) format.
-    if block_shape == [1, MXFP8_BLOCK_SIZE]:
+    if block_shape == [1, 32]:
         return FusedMoEQuantConfig.make(
             "mxfp8",
             w1_scale=w1_scale,

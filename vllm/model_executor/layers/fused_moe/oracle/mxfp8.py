@@ -17,14 +17,12 @@ logger = init_logger(__name__)
 
 _SUPPORTED_BACKENDS = (
     Fp8MoeBackend.BATCHED_FLASHINFER_MXFP8,
-    Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
     Fp8MoeBackend.FLASHINFER_TRTLLM,
     Fp8MoeBackend.MARLIN,
     Fp8MoeBackend.XPU,
 )
 
 _BACKEND_NAME_MAP: dict[str, Fp8MoeBackend] = {
-    "cutlass": Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
     "flashinfer_trtllm": Fp8MoeBackend.FLASHINFER_TRTLLM,
     "flashinfer_cutedsl": Fp8MoeBackend.BATCHED_FLASHINFER_MXFP8,
     "marlin": Fp8MoeBackend.MARLIN,

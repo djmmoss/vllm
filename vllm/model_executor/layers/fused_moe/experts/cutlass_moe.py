@@ -30,10 +30,6 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
 )
-from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-    MXFP8_BLOCK_SIZE,
-    swizzle_mxfp8_scale,
-)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8DynamicTensorSym,
@@ -42,8 +38,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
     kMxfp4Dynamic,
     kMxfp4Static,
-    kMxfp8Dynamic,
-    kMxfp8Static,
     kNvfp4Dynamic,
     kNvfp4Static,
 )
@@ -54,10 +48,6 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
 logger = init_logger(__name__)
-
-
-def _align_to(val: int, alignment: int) -> int:
-    return (val + alignment - 1) // alignment * alignment
 
 
 def run_cutlass_moe_fp8(
@@ -274,208 +264,6 @@ def run_cutlass_moe_fp8(
         )
 
 
-def _make_batched_mxfp8_problem_data(
-    expert_num_tokens: torch.Tensor,
-    max_num_tokens: int,
-    n: int,
-    k: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    assert n % 128 == 0, "MXFP8 grouped GEMM requires N to align to 128"
-    assert k % 128 == 0, "MXFP8 grouped GEMM requires K to align to 128"
-
-    num_experts = expert_num_tokens.numel()
-    device = expert_num_tokens.device
-    problem_sizes = torch.empty((num_experts, 3), dtype=torch.int32, device=device)
-    problem_sizes[:, 0].copy_(expert_num_tokens.to(torch.int32))
-    problem_sizes[:, 1].fill_(n)
-    problem_sizes[:, 2].fill_(k)
-
-    expert_offsets = torch.arange(num_experts, dtype=torch.int32, device=device)
-    expert_offsets *= max_num_tokens
-
-    scale_stride = _align_to(max_num_tokens, 128)
-    blockscale_offsets = torch.arange(num_experts, dtype=torch.int32, device=device)
-    blockscale_offsets *= scale_stride
-
-    scale_rows = num_experts * scale_stride
-    return problem_sizes, expert_offsets, blockscale_offsets, scale_rows
-
-
-def _mxfp8_quantize_batched_experts(
-    input_tensor: torch.Tensor,
-    problem_sizes: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    blockscale_offsets: torch.Tensor,
-    scale_rows: int,
-    quant_output: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    assert input_tensor.dim() == 2
-    assert input_tensor.is_contiguous()
-    k = input_tensor.size(1)
-    # `FusedMoEKernelModularImpl._allocate_buffers` aliases `workspace13` and
-    # the per-MoE-call output buffer to the same storage, so viewing
-    # `quant_output` (== workspace13) as `input_quant` makes the gemm2 input
-    # alias the gemm2 destination. Allocate `input_quant` as fresh storage.
-    input_quant = torch.empty(
-        input_tensor.shape,
-        dtype=torch.float8_e4m3fn,
-        device=input_tensor.device,
-    )
-    input_scale = torch.empty(
-        (scale_rows, k // MXFP8_BLOCK_SIZE),
-        dtype=torch.uint8,
-        device=input_tensor.device,
-    )
-    ops.mxfp8_experts_quant(
-        input_tensor,
-        problem_sizes,
-        expert_offsets,
-        blockscale_offsets,
-        input_quant,
-        input_scale,
-    )
-    return input_quant, input_scale
-
-
-def _format_deepep_mxfp8_scales_for_cutlass(
-    act_scales: torch.Tensor,
-    max_num_tokens: int,
-    hidden_dim: int,
-    scale_rows: int,
-) -> torch.Tensor:
-    num_scale_groups = hidden_dim // MXFP8_BLOCK_SIZE
-    assert act_scales.dtype == torch.uint8
-    assert act_scales.dim() == 3
-    assert act_scales.is_contiguous()
-    assert act_scales.size(2) == num_scale_groups
-
-    num_experts = act_scales.size(0)
-    scale_stride = _align_to(max_num_tokens, 128)
-    assert scale_rows == num_experts * scale_stride
-    assert act_scales.size(1) == scale_stride
-
-    swizzled = [
-        swizzle_mxfp8_scale(act_scales[e], M=scale_stride, K=hidden_dim)
-        for e in range(num_experts)
-    ]
-    return torch.stack(swizzled, dim=0).view(scale_rows, num_scale_groups)
-
-
-def run_cutlass_batched_moe_mxfp8(
-    output: torch.Tensor,
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    expert_num_tokens: torch.Tensor,
-    activation: MoEActivation,
-    workspace13: torch.Tensor,
-    workspace2: torch.Tensor,
-    a1q_scale: torch.Tensor | None = None,
-) -> None:
-    assert hidden_states.dim() == 3
-    assert output.shape == hidden_states.shape
-    assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
-    assert output.is_contiguous(), "output must be contiguous"
-    assert w1.dtype == torch.float8_e4m3fn
-    assert w2.dtype == torch.float8_e4m3fn
-    assert w1_scale.dtype == torch.uint8
-    assert w2_scale.dtype == torch.uint8
-    assert w1.stride(1) == 1, "w1 must be column major"
-    assert w2.stride(1) == 1, "w2 must be column major"
-
-    num_experts, max_num_tokens, hidden_dim = hidden_states.shape
-    assert w1.size(0) == num_experts
-    assert w2.size(0) == num_experts
-    assert w1.size(1) == hidden_dim
-    assert w2.size(2) == hidden_dim
-
-    gemm1_n = w1.size(2)
-    intermediate_dim = w2.size(1)
-    activation_out_dim = gemm1_n if not activation.is_gated else gemm1_n // 2
-    assert activation_out_dim == intermediate_dim
-
-    hidden_states_flat = hidden_states.view(-1, hidden_dim)
-    problem_sizes1, expert_offsets, blockscale_offsets, scale_rows1 = (
-        _make_batched_mxfp8_problem_data(
-            expert_num_tokens=expert_num_tokens,
-            max_num_tokens=max_num_tokens,
-            n=gemm1_n,
-            k=hidden_dim,
-        )
-    )
-
-    if a1q_scale is not None:
-        assert hidden_states.dtype == torch.float8_e4m3fn
-        a1q = hidden_states_flat
-        a1q_scale = _format_deepep_mxfp8_scales_for_cutlass(
-            a1q_scale,
-            max_num_tokens=max_num_tokens,
-            hidden_dim=hidden_dim,
-            scale_rows=scale_rows1,
-        )
-        assert a1q_scale.dtype == torch.uint8
-    else:
-        assert hidden_states.dtype in (torch.float16, torch.bfloat16)
-        a1q, a1q_scale = _mxfp8_quantize_batched_experts(
-            hidden_states_flat,
-            problem_sizes1,
-            expert_offsets,
-            blockscale_offsets,
-            scale_rows1,
-            workspace2,
-        )
-
-    # gemm1 can consume DeepEP-dispatched MXFP8 activations; gemm2's input is
-    # produced locally by the activation kernel, so it is always quantized here.
-    gemm1_out = _resize_cache(workspace13, (num_experts * max_num_tokens, gemm1_n))
-    ops.cutlass_mxfp8_grouped_mm(
-        a1q,
-        w1,
-        a1q_scale,
-        w1_scale,
-        gemm1_out,
-        problem_sizes1,
-        expert_offsets,
-        blockscale_offsets,
-    )
-
-    act_out = _resize_cache(
-        workspace2, (num_experts * max_num_tokens, activation_out_dim)
-    )
-    apply_moe_activation(activation, act_out, gemm1_out)
-
-    problem_sizes2, expert_offsets, blockscale_offsets, scale_rows2 = (
-        _make_batched_mxfp8_problem_data(
-            expert_num_tokens=expert_num_tokens,
-            max_num_tokens=max_num_tokens,
-            n=hidden_dim,
-            k=activation_out_dim,
-        )
-    )
-
-    a2q, a2q_scale = _mxfp8_quantize_batched_experts(
-        act_out,
-        problem_sizes2,
-        expert_offsets,
-        blockscale_offsets,
-        scale_rows2,
-        workspace13,
-    )
-
-    ops.cutlass_mxfp8_grouped_mm(
-        a2q,
-        w2,
-        a2q_scale,
-        w2_scale,
-        output.view(-1, hidden_dim),
-        problem_sizes2,
-        expert_offsets,
-        blockscale_offsets,
-    )
-
-
 class CutlassExpertsFp8Base(mk.FusedMoEExpertsModular):
     def __init__(
         self,
@@ -686,161 +474,6 @@ class CutlassBatchedExpertsFp8(CutlassExpertsFp8Base):
         )
         output = (experts_per_worker, M, K)
         return (workspace1, workspace2, output)
-
-
-class CutlassBatchedExpertsMxfp8(mk.FusedMoEExpertsModular):
-    """Batched CUTLASS MXFP8 fused MoE expert implementation."""
-
-    def __init__(
-        self,
-        moe_config: FusedMoEConfig,
-        quant_config: FusedMoEQuantConfig,
-        max_num_tokens: int | None = None,
-        num_dispatchers: int | None = None,
-    ):
-        super().__init__(
-            moe_config=moe_config,
-            quant_config=quant_config,
-            max_num_tokens=max_num_tokens,
-            num_dispatchers=num_dispatchers,
-        )
-        assert quant_config.quant_dtype == "mxfp8"
-        assert quant_config.weight_quant_dtype == "mxfp8"
-        assert quant_config.block_shape == [1, MXFP8_BLOCK_SIZE]
-        self.out_dtype = moe_config.in_dtype
-
-    @property
-    def expects_unquantized_inputs(self) -> bool:
-        # Non-native prepare paths send BF16 activations for local MXFP8
-        # quantization. DeepEPLL native MXFP8 overrides the prepare policy.
-        return True
-
-    @staticmethod
-    def activation_format() -> mk.FusedMoEActivationFormat:
-        return mk.FusedMoEActivationFormat.BatchedExperts
-
-    @staticmethod
-    def _supports_current_device() -> bool:
-        return (
-            current_platform.is_cuda()
-            and current_platform.is_device_capability_family(100)
-        )
-
-    @staticmethod
-    def _supports_no_act_and_mul() -> bool:
-        return False
-
-    @staticmethod
-    def _supports_quant_scheme(
-        weight_key: QuantKey | None,
-        activation_key: QuantKey | None,
-    ) -> bool:
-        return (weight_key, activation_key) == (kMxfp8Static, kMxfp8Dynamic)
-
-    @staticmethod
-    def _supports_activation(activation: MoEActivation) -> bool:
-        return activation in [
-            MoEActivation.SILU,
-            MoEActivation.GELU,
-            MoEActivation.SWIGLUOAI,
-        ]
-
-    @staticmethod
-    def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
-        return moe_parallel_config.use_deepep_ll_kernels
-
-    def supports_expert_map(self) -> bool:
-        return False
-
-    def supports_native_mxfp8_act_scales(self) -> bool:
-        return True
-
-    def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
-        return TopKWeightAndReduceDelegate()
-
-    def workspace_dtype(self, act_dtype: torch.dtype) -> torch.dtype:
-        return self.out_dtype if self.out_dtype is not None else act_dtype
-
-    def moe_problem_size(
-        self,
-        a1: torch.Tensor,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> tuple[int, int, int, int, int]:
-        assert a1.dim() == 3
-        assert w1.dim() == 3 and w2.dim() == 3
-        E = w1.size(0)
-        assert a1.size(0) == E
-        M = a1.size(1)
-        N = w1.size(2)
-        K = a1.size(-1)
-        topk = topk_ids.size(1)
-        return E, M, N, K, topk
-
-    def workspace_shapes(
-        self,
-        M: int,
-        N: int,
-        K: int,
-        topk: int,
-        global_num_experts: int,
-        local_num_experts: int,
-        expert_tokens_meta: mk.ExpertTokensMetadata | None,
-        activation: MoEActivation,
-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        num_dp = self.num_dispatchers
-        assert num_dp is not None
-        experts_per_worker = self.moe_config.num_local_experts
-        activation_out_dim = self.adjust_N_for_activation(N, activation)
-        workspace13 = (experts_per_worker, M * num_dp, max(N, K))
-        workspace2 = (
-            experts_per_worker,
-            M * num_dp,
-            max(activation_out_dim, K),
-        )
-        output = (experts_per_worker, M, K)
-        return (workspace13, workspace2, output)
-
-    def apply(
-        self,
-        output: torch.Tensor,
-        hidden_states: torch.Tensor,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        activation: MoEActivation,
-        global_num_experts: int,
-        expert_map: torch.Tensor | None,
-        a1q_scale: torch.Tensor | None,
-        a2_scale: torch.Tensor | None,
-        workspace13: torch.Tensor,
-        workspace2: torch.Tensor,
-        expert_tokens_meta: mk.ExpertTokensMetadata | None,
-        apply_router_weight_on_input: bool,
-    ):
-        if a1q_scale is not None:
-            assert hidden_states.dtype == torch.float8_e4m3fn
-        else:
-            assert hidden_states.dtype in (torch.float16, torch.bfloat16)
-        assert a2_scale is None
-        assert expert_tokens_meta is not None
-        assert self.w1_scale is not None
-        assert self.w2_scale is not None
-        run_cutlass_batched_moe_mxfp8(
-            output=output,
-            hidden_states=hidden_states,
-            w1=w1,
-            w2=w2,
-            w1_scale=self.w1_scale,
-            w2_scale=self.w2_scale,
-            expert_num_tokens=expert_tokens_meta.expert_num_tokens,
-            activation=activation,
-            workspace13=workspace13,
-            workspace2=workspace2,
-            a1q_scale=a1q_scale,
-        )
 
 
 FLOAT4_E2M1_MAX = scalar_types.float4_e2m1f.max()
@@ -1320,7 +953,7 @@ def swizzle_mxfp4_scales(
     with kIdx = col_in_scale_space (i.e., index into K//32).
     """
     assert scales.dtype == torch.uint8
-    num_scale_cols = K // MXFP8_BLOCK_SIZE
+    num_scale_cols = K // 32  # number of E8M0 scale values per row
 
     num_m_tiles = (N + 127) // 128
     num_k_tiles = (num_scale_cols + 3) // 4
