@@ -29,7 +29,9 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     mxfp8_e4m3_quantize,
 )
 from vllm.platforms import current_platform
-from vllm.utils.flashinfer import has_flashinfer_cutedsl_grouped_gemm_nt_masked
+from vllm.utils.flashinfer import (
+    has_flashinfer_cutedsl_grouped_gemm_nt_masked_zero_output,
+)
 
 if not current_platform.has_device_capability(100):
     pytest.skip(
@@ -262,8 +264,8 @@ def _apply_cutedsl_mxfp8_experts(
 
 
 @pytest.mark.skipif(
-    not has_flashinfer_cutedsl_grouped_gemm_nt_masked(),
-    reason="FlashInfer CuteDSL grouped masked GEMM is unavailable.",
+    not has_flashinfer_cutedsl_grouped_gemm_nt_masked_zero_output(),
+    reason="FlashInfer CuteDSL grouped masked GEMM zeroing is unavailable.",
 )
 def test_cutedsl_mxfp8_non_native_dispatch_locally_quantizes_bf16_input():
     _run_case_in_subprocess(
@@ -376,8 +378,8 @@ def _case_cutedsl_mxfp8_non_native_dispatch_locally_quantizes_bf16_input():
 
 
 @pytest.mark.skipif(
-    not has_flashinfer_cutedsl_grouped_gemm_nt_masked(),
-    reason="FlashInfer CuteDSL grouped masked GEMM is unavailable.",
+    not has_flashinfer_cutedsl_grouped_gemm_nt_masked_zero_output(),
+    reason="FlashInfer CuteDSL grouped masked GEMM zeroing is unavailable.",
 )
 def test_cutedsl_mxfp8_native_dispatch_masks_invalid_a1_rows():
     _run_case_in_subprocess(
@@ -386,18 +388,8 @@ def test_cutedsl_mxfp8_native_dispatch_masks_invalid_a1_rows():
 
 
 @pytest.mark.skipif(
-    not has_flashinfer_cutedsl_grouped_gemm_nt_masked(),
-    reason="FlashInfer CuteDSL grouped masked GEMM is unavailable.",
-)
-def test_cutedsl_mxfp8_scale_sanitizer_zeroes_invalid_rows_in_place():
-    _run_case_in_subprocess(
-        "_case_cutedsl_mxfp8_scale_sanitizer_zeroes_invalid_rows_in_place"
-    )
-
-
-@pytest.mark.skipif(
-    not has_flashinfer_cutedsl_grouped_gemm_nt_masked(),
-    reason="FlashInfer CuteDSL grouped masked GEMM is unavailable.",
+    not has_flashinfer_cutedsl_grouped_gemm_nt_masked_zero_output(),
+    reason="FlashInfer CuteDSL grouped masked GEMM zeroing is unavailable.",
 )
 def test_cutedsl_mxfp8_native_dispatch_ignores_stale_workspaces():
     _run_case_in_subprocess(
@@ -406,8 +398,8 @@ def test_cutedsl_mxfp8_native_dispatch_ignores_stale_workspaces():
 
 
 @pytest.mark.skipif(
-    not has_flashinfer_cutedsl_grouped_gemm_nt_masked(),
-    reason="FlashInfer CuteDSL grouped masked GEMM is unavailable.",
+    not has_flashinfer_cutedsl_grouped_gemm_nt_masked_zero_output(),
+    reason="FlashInfer CuteDSL grouped masked GEMM zeroing is unavailable.",
 )
 def test_cutedsl_mxfp8_native_dispatch_does_not_full_zero_workspaces():
     _run_case_in_subprocess(
@@ -415,42 +407,20 @@ def test_cutedsl_mxfp8_native_dispatch_does_not_full_zero_workspaces():
     )
 
 
+def test_cutedsl_mxfp8_native_dispatch_uses_flashinfer_zeroing():
+    _run_case_in_subprocess(
+        "_case_cutedsl_mxfp8_native_dispatch_uses_flashinfer_zeroing"
+    )
+
+
 @pytest.mark.skipif(
-    not has_flashinfer_cutedsl_grouped_gemm_nt_masked(),
-    reason="FlashInfer CuteDSL grouped masked GEMM is unavailable.",
+    not has_flashinfer_cutedsl_grouped_gemm_nt_masked_zero_output(),
+    reason="FlashInfer CuteDSL grouped masked GEMM zeroing is unavailable.",
 )
 def test_cutedsl_mxfp8_native_dispatch_high_hidden_dim_a2_scales():
     _run_case_in_subprocess(
         "_case_cutedsl_mxfp8_native_dispatch_high_hidden_dim_a2_scales"
     )
-
-
-@torch.inference_mode()
-def _case_cutedsl_mxfp8_scale_sanitizer_zeroes_invalid_rows_in_place():
-    from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_batched_mxfp8_moe import (  # noqa: E501
-        _zero_invalid_scale_rows,
-    )
-
-    device = "cuda"
-    scale = torch.tensor(
-        [
-            [[1, 2, 0xFF], [3, 4, 5], [6, 0xFF, 8], [9, 10, 11]],
-            [[12, 13, 14], [0xFF, 16, 17], [18, 19, 20], [21, 22, 23]],
-        ],
-        dtype=torch.uint8,
-        device=device,
-    )
-    expert_num_tokens = torch.tensor([2, 4], dtype=torch.int32, device=device)
-    expected = scale.clone()
-    expected[0, 2:] = 0
-    expected[expected == 0xFF] = 0
-
-    data_ptr = scale.data_ptr()
-    _zero_invalid_scale_rows(scale, expert_num_tokens)
-    torch.cuda.synchronize()
-
-    assert scale.data_ptr() == data_ptr
-    torch.testing.assert_close(scale, expected)
 
 
 @torch.inference_mode()
@@ -748,6 +718,148 @@ def _case_cutedsl_mxfp8_native_dispatch_does_not_full_zero_workspaces():
         if old_zero_two_tensors is not None:
             cutedsl_mxfp8_moe._zero_two_tensors = old_zero_two_tensors
 
+    valid = (
+        torch.arange(max_tokens, device=device).unsqueeze(0)
+        < expert_num_tokens.unsqueeze(1)
+    )
+    assert torch.isfinite(output[valid]).all()
+
+
+@torch.inference_mode()
+def _case_cutedsl_mxfp8_native_dispatch_uses_flashinfer_zeroing():
+    from vllm.model_executor.layers.fused_moe.experts import (
+        flashinfer_cutedsl_batched_mxfp8_moe as cutedsl_mxfp8_moe,
+    )
+
+    torch.manual_seed(4)
+    device = "cuda"
+    num_experts = 2
+    max_tokens = 7
+    hidden_dim = 512
+    intermediate_dim = 128
+    expert_num_tokens = torch.tensor([7, 3], dtype=torch.int32, device=device)
+    hidden_fp8 = (
+        torch.randn(num_experts, max_tokens, hidden_dim, device=device) / 10
+    ).to(torch.float8_e4m3fn)
+    scale_stride = _align128(max_tokens)
+    hidden_scale = torch.zeros(
+        (num_experts, scale_stride, hidden_dim // MXFP8_BLOCK_SIZE),
+        dtype=torch.uint8,
+        device=device,
+    )
+    w1 = (
+        torch.randn(num_experts, 2 * intermediate_dim, hidden_dim, device=device) / 10
+    ).to(torch.float8_e4m3fn)
+    w2 = (
+        torch.randn(num_experts, hidden_dim, intermediate_dim, device=device) / 10
+    ).to(torch.float8_e4m3fn)
+    w1_scale = torch.zeros(
+        (num_experts, 2 * intermediate_dim, hidden_dim // MXFP8_BLOCK_SIZE),
+        dtype=torch.uint8,
+        device=device,
+    )
+    w2_scale = torch.zeros(
+        (num_experts, hidden_dim, intermediate_dim // MXFP8_BLOCK_SIZE),
+        dtype=torch.uint8,
+        device=device,
+    )
+    experts = _make_cutedsl_mxfp8_experts(
+        num_experts,
+        max_tokens,
+        hidden_dim,
+        intermediate_dim,
+        w1_scale,
+        w2_scale,
+        device,
+    )
+    workspace13 = torch.empty(
+        (num_experts, max_tokens, max(2 * intermediate_dim, hidden_dim)),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    workspace2 = torch.empty(
+        (num_experts, max_tokens, max(intermediate_dim, hidden_dim)),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    output = torch.empty(
+        (num_experts, max_tokens, hidden_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    old_flashinfer_gemm = cutedsl_mxfp8_moe.flashinfer_cutedsl_grouped_gemm_nt_masked
+    old_quantize_act_for_cute = cutedsl_mxfp8_moe._quantize_act_for_cute
+    zero_masked_output_values = []
+    zero_masked_sfa_values = []
+
+    def checked_flashinfer_gemm(*args, **kwargs):
+        zero_masked_output_values.append(kwargs.get("zero_masked_output"))
+        zero_masked_sfa_values.append(kwargs.get("zero_masked_sfa"))
+        out = args[2]
+        masked_m = args[3]
+        out.zero_()
+        for expert in range(masked_m.numel()):
+            out[: int(masked_m[expert].item()), :, expert] = 1
+
+    def fake_quantize_act_for_cute(
+        act_out,
+        expert_num_tokens_arg,
+        num_experts_arg,
+        max_num_tokens_arg,
+        n_out,
+    ):
+        del expert_num_tokens_arg
+        fp8 = torch.zeros(
+            (num_experts_arg * max_num_tokens_arg, n_out),
+            dtype=torch.float8_e4m3fn,
+            device=act_out.device,
+        )
+        sf = torch.zeros(
+            (
+                num_experts_arg,
+                _align128(max_num_tokens_arg),
+                n_out // MXFP8_BLOCK_SIZE,
+            ),
+            dtype=torch.uint8,
+            device=act_out.device,
+        )
+        return fp8, sf.view(num_experts_arg, -1).view(torch.float8_e8m0fnu)
+
+    cutedsl_mxfp8_moe.flashinfer_cutedsl_grouped_gemm_nt_masked = (
+        checked_flashinfer_gemm
+    )
+    cutedsl_mxfp8_moe._quantize_act_for_cute = fake_quantize_act_for_cute
+    try:
+        experts.apply(
+            output=output,
+            hidden_states=hidden_fp8,
+            w1=w1,
+            w2=w2,
+            topk_weights=torch.ones(
+                (max_tokens, 1), dtype=torch.float32, device=device
+            ),
+            topk_ids=torch.zeros((max_tokens, 1), dtype=torch.long, device=device),
+            activation=MoEActivation.SILU,
+            global_num_experts=num_experts,
+            expert_map=None,
+            a1q_scale=hidden_scale,
+            a2_scale=None,
+            workspace13=workspace13,
+            workspace2=workspace2,
+            expert_tokens_meta=ExpertTokensMetadata(
+                expert_num_tokens=expert_num_tokens, expert_num_tokens_cpu=None
+            ),
+            apply_router_weight_on_input=False,
+        )
+    finally:
+        cutedsl_mxfp8_moe.flashinfer_cutedsl_grouped_gemm_nt_masked = (
+            old_flashinfer_gemm
+        )
+        cutedsl_mxfp8_moe._quantize_act_for_cute = old_quantize_act_for_cute
+
+    assert zero_masked_output_values == [True, True]
+    assert zero_masked_sfa_values == [True, True]
     valid = (
         torch.arange(max_tokens, device=device).unsqueeze(0)
         < expert_num_tokens.unsqueeze(1)

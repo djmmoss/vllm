@@ -9,6 +9,7 @@ import contextlib
 import functools
 import importlib
 import importlib.util
+import inspect
 import os
 import shutil
 from collections.abc import Callable
@@ -256,6 +257,25 @@ def has_flashinfer_cutedsl_grouped_gemm_nt_masked() -> bool:
         if not mod or not hasattr(mod, attr_name):
             return False
     return True
+
+
+@functools.cache
+def has_flashinfer_cutedsl_grouped_gemm_nt_masked_zero_output() -> bool:
+    """Return ``True`` if FlashInfer masked grouped GEMM has MXFP8 masking."""
+    if not has_flashinfer_cutedsl_grouped_gemm_nt_masked():
+        return False
+
+    mod = _get_submodule("flashinfer.cute_dsl.blockscaled_gemm")
+    if mod is None:
+        return False
+    fn = getattr(mod, "grouped_gemm_nt_masked", None)
+    if fn is None:
+        return False
+    try:
+        source = inspect.getsource(fn)
+    except (OSError, TypeError):
+        return False
+    return "zero_masked_output" in source and "zero_masked_sfa" in source
 
 
 @functools.cache
@@ -935,6 +955,7 @@ __all__ = [
     "has_flashinfer_nvlink_one_sided",
     "has_flashinfer_cutlass_fused_moe",
     "has_flashinfer_cutedsl_grouped_gemm_nt_masked",
+    "has_flashinfer_cutedsl_grouped_gemm_nt_masked_zero_output",
     "has_flashinfer_cutedsl_moe_nvfp4",
     "has_flashinfer_fp8_blockscale_gemm",
     "has_nvidia_artifactory",

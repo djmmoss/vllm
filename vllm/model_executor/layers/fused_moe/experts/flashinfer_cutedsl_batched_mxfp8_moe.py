@@ -39,7 +39,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import (
     flashinfer_cutedsl_grouped_gemm_nt_masked,
-    has_flashinfer_cutedsl_grouped_gemm_nt_masked,
+    has_flashinfer_cutedsl_grouped_gemm_nt_masked_zero_output,
 )
 
 logger = init_logger(__name__)
@@ -47,131 +47,6 @@ logger = init_logger(__name__)
 _BATCHED_PROBLEM_OFFSETS_CACHE: dict[
     tuple[str, int, int, int], tuple[torch.Tensor, torch.Tensor]
 ] = {}
-
-
-@triton.jit
-def _zero_invalid_rows_kernel(
-    tensor_ptr,
-    expert_num_tokens_ptr,
-    M: tl.constexpr,
-    K: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    expert = tl.program_id(0)
-    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    valid_tokens = tl.load(expert_num_tokens_ptr + expert)
-    mask = (offsets < M * K) & (offsets >= valid_tokens * K)
-    zero = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-    tl.store(tensor_ptr + expert * M * K + offsets, zero, mask=mask)
-
-
-def _zero_invalid_rows(tensor: torch.Tensor, expert_num_tokens: torch.Tensor) -> None:
-    assert tensor.is_contiguous()
-    assert tensor.dim() == 3
-    E, M, K = tensor.shape
-    if E == 0 or M == 0 or K == 0:
-        return
-    block_size = 1024
-    _zero_invalid_rows_kernel[(E, triton.cdiv(M * K, block_size))](
-        tensor, expert_num_tokens, M, K, BLOCK_SIZE=block_size
-    )
-
-
-@triton.jit
-def _zero_invalid_scale_rows_kernel(
-    scale_ptr,
-    expert_num_tokens_ptr,
-    M: tl.constexpr,
-    K: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    expert = tl.program_id(0)
-    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    row_offsets = offsets // K
-    valid_tokens = tl.load(expert_num_tokens_ptr + expert)
-    in_bounds = offsets < M * K
-    values = tl.load(
-        scale_ptr + expert * M * K + offsets,
-        mask=in_bounds,
-        other=0,
-    )
-    mask = in_bounds & ((row_offsets >= valid_tokens) | (values == 0xFF))
-    zero = tl.zeros((BLOCK_SIZE,), dtype=tl.uint8)
-    tl.store(scale_ptr + expert * M * K + offsets, zero, mask=mask)
-
-
-def _zero_invalid_scale_rows(
-    scale: torch.Tensor, expert_num_tokens: torch.Tensor
-) -> None:
-    assert scale.is_contiguous()
-    assert scale.dtype == torch.uint8
-    assert scale.dim() == 3
-    E, M, K = scale.shape
-    if E == 0 or M == 0 or K == 0:
-        return
-    block_size = 1024
-    _zero_invalid_scale_rows_kernel[(E, triton.cdiv(M * K, block_size))](
-        scale, expert_num_tokens, M, K, BLOCK_SIZE=block_size
-    )
-
-
-@triton.jit
-def _zero_invalid_swizzled_scale_rows_kernel(
-    scale_ptr,
-    expert_num_tokens_ptr,
-    M: tl.constexpr,
-    K: tl.constexpr,
-    NUM_K_TILES: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    expert = tl.program_id(0)
-    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    in_bounds = offsets < M * K
-
-    k4 = offsets % 4
-    tmp = offsets // 4
-    m4 = tmp % 4
-    tmp = tmp // 4
-    m32 = tmp % 32
-    tmp = tmp // 32
-    kt = tmp % NUM_K_TILES
-    mt = tmp // NUM_K_TILES
-    row_offsets = mt * 128 + m4 * 32 + m32
-    scale_cols = kt * 4 + k4
-
-    values = tl.load(
-        scale_ptr + expert * M * K + offsets,
-        mask=in_bounds,
-        other=0,
-    )
-    valid_tokens = tl.load(expert_num_tokens_ptr + expert)
-    mask = in_bounds & (
-        (row_offsets >= valid_tokens) | (scale_cols >= K) | (values == 0xFF)
-    )
-    zero = tl.zeros((BLOCK_SIZE,), dtype=tl.uint8)
-    tl.store(scale_ptr + expert * M * K + offsets, zero, mask=mask)
-
-
-def _zero_invalid_swizzled_scale_rows(
-    scale: torch.Tensor, expert_num_tokens: torch.Tensor
-) -> None:
-    assert scale.is_contiguous()
-    assert scale.dtype == torch.uint8
-    assert scale.dim() == 3
-    E, M, K = scale.shape
-    assert M % 128 == 0
-    assert K % 4 == 0
-    if E == 0 or M == 0 or K == 0:
-        return
-    block_size = 1024
-    _zero_invalid_swizzled_scale_rows_kernel[(E, triton.cdiv(M * K, block_size))](
-        scale,
-        expert_num_tokens,
-        M,
-        K,
-        NUM_K_TILES=triton.cdiv(K, 4),
-        BLOCK_SIZE=block_size,
-    )
 
 
 def _align128(val: int) -> int:
@@ -273,9 +148,9 @@ def _quantize_act_for_cute(
     stale fragment registers, which empirically changes the SF that's
     computed even for valid rows (the warp shuffle reduces over a register
     fragment whose lanes include the unloaded positions). To get SF that
-    matches the CUTLASS quantize for valid rows, pass ``m = expert_num_tokens``
-    here, then zero out past-mask SF bytes ourselves so the cute masked MMA
-    doesn't accumulate stale TMA-pushed scale contributions.
+    matches the CUTLASS quantize for valid rows, pass ``m = expert_num_tokens``.
+    FlashInfer masks invalid SFA rows while consuming this swizzled scale
+    tensor, avoiding a separate cleanup launch here.
     """
     assert act_out.dim() == 2
     assert act_out.size(0) == num_experts * max_num_tokens
@@ -296,14 +171,6 @@ def _quantize_act_for_cute(
     )
     ops.mxfp8_experts_quant(
         act_out, problem_sizes, expert_offsets, blockscale_offsets, fp8, sf_rm
-    )
-    # ``mxfp8_experts_quant`` writes scale factors in the Cute/CUTLASS swizzled
-    # layout already. Zero past-mask SF bytes in that layout: the grouped GEMM
-    # can TMA-read a whole scale tile even when masked_m is smaller.
-    scale_stride = scale_rows // num_experts
-    _zero_invalid_swizzled_scale_rows(
-        sf_rm.view(num_experts, scale_stride, n_out // MXFP8_BLOCK_SIZE),
-        expert_num_tokens,
     )
     return fp8, sf_rm.view(num_experts, -1).view(torch.float8_e8m0fnu)
 
@@ -342,7 +209,7 @@ class FlashInferCuteDSLBatchedExpertsMxfp8(mk.FusedMoEExpertsModular):
         return (
             current_platform.is_cuda()
             and current_platform.is_device_capability_family(100)
-            and has_flashinfer_cutedsl_grouped_gemm_nt_masked()
+            and has_flashinfer_cutedsl_grouped_gemm_nt_masked_zero_output()
         )
 
     @staticmethod
@@ -458,16 +325,7 @@ class FlashInferCuteDSLBatchedExpertsMxfp8(mk.FusedMoEExpertsModular):
         if a1q_scale is not None:
             assert hidden_states.dtype == torch.float8_e4m3fn
             assert a1q_scale.dim() == 3
-            # The cute masked GEMM may read FP8 payload rows beyond masked_m
-            # while forming tiles. Keep those rows finite without allocating a
-            # full torch.where copy of the dispatch buffer.
-            _zero_invalid_rows(hidden_states, expert_tokens_meta.expert_num_tokens)
             a1_fp8 = hidden_states
-            # Sanitize beyond-mask scale rows from the DeepEP recv buffer. The
-            # cute masked GEMM can see stale TMA-pushed scale data past
-            # ``masked_m``; CUTLASS avoids this through per-expert problem
-            # sizes that bound both reads and writes.
-            _zero_invalid_scale_rows(a1q_scale, expert_tokens_meta.expert_num_tokens)
             a1_sf_cute = swizzle_mxfp8_scales_batched_for_cute(
                 a1q_scale, E, scale_stride, K
             ).view(torch.float8_e8m0fnu)
@@ -492,10 +350,9 @@ class FlashInferCuteDSLBatchedExpertsMxfp8(mk.FusedMoEExpertsModular):
             sf_dtype="float8_e8m0fnu",
             c_dtype="bfloat16",
             sf_vec_size=MXFP8_BLOCK_SIZE,
+            zero_masked_output=True,
+            zero_masked_sfa=True,
         )
-        # The activation kernel reads the full workspace row range. Keep only
-        # invalid GEMM1 rows finite instead of pre-zeroing the whole workspace.
-        _zero_invalid_rows(gemm1_out, expert_tokens_meta.expert_num_tokens)
 
         act_out = _resize_cache(workspace2, (E * M_max, N))
         apply_moe_activation(activation, act_out, gemm1_out.view(E * M_max, N2))
@@ -518,4 +375,6 @@ class FlashInferCuteDSLBatchedExpertsMxfp8(mk.FusedMoEExpertsModular):
             sf_dtype="float8_e8m0fnu",
             c_dtype="bfloat16",
             sf_vec_size=MXFP8_BLOCK_SIZE,
+            zero_masked_output=True,
+            zero_masked_sfa=True,
         )
