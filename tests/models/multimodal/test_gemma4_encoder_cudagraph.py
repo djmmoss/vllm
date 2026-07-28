@@ -4,12 +4,14 @@
 from types import SimpleNamespace
 from typing import cast
 
+import pytest
 import torch
 from torch import nn
 
 from vllm.config import VllmConfig
 from vllm.model_executor.models.gemma4_mm import (
     Gemma4ForConditionalGeneration,
+    _get_gemma4_vision_use_cudnn_sdpa,
 )
 from vllm.model_executor.models.interfaces import (
     supports_encoder_cudagraph,
@@ -27,6 +29,7 @@ def _make_model() -> Gemma4ForConditionalGeneration:
         ),
         text_config=SimpleNamespace(hidden_size=16),
     )
+    model._vision_use_cudnn_sdpa = False
     return model
 
 
@@ -111,3 +114,20 @@ def test_gemma4_encoder_cudagraph_capture_and_replay_buffers() -> None:
     assert replay.buffers == {
         "pixel_position_ids": capture.mm_kwargs["pixel_position_ids"]
     }
+
+
+def test_gemma4_vision_cudnn_sdpa_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_name = "VLLM_GEMMA4_VISION_USE_CUDNN_SDPA"
+    monkeypatch.delenv(env_name, raising=False)
+    assert not _get_gemma4_vision_use_cudnn_sdpa()
+
+    monkeypatch.setenv(env_name, "1")
+    assert _get_gemma4_vision_use_cudnn_sdpa()
+
+    monkeypatch.setenv(env_name, "true")
+    assert _get_gemma4_vision_use_cudnn_sdpa()
+
+    monkeypatch.setenv(env_name, "0")
+    assert not _get_gemma4_vision_use_cudnn_sdpa()
