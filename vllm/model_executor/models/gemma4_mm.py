@@ -67,6 +67,7 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from .interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
+    SupportsEncoderCudaGraph,
     SupportsLoRA,
     SupportsMultiModal,
     SupportsPP,
@@ -916,6 +917,7 @@ class Gemma4MultimodalEmbedder(nn.Module):
 class Gemma4ForConditionalGeneration(
     nn.Module,
     SupportsMultiModal,
+    SupportsEncoderCudaGraph,
     SupportsPP,
     SupportsLoRA,
     SupportsEagle3,
@@ -1286,6 +1288,236 @@ class Gemma4ForConditionalGeneration(
                 )
 
         return multimodal_embeddings
+
+    # ------------------------------------------------------------------ #
+    # SupportsEncoderCudaGraph interface
+    # ------------------------------------------------------------------ #
+
+    def get_encoder_cudagraph_config(self):
+        from vllm.v1.worker.encoder_cudagraph_defs import (
+            EncoderCudaGraphConfig,
+        )
+
+        return EncoderCudaGraphConfig(
+            modalities=["image"],
+            input_key_by_modality={"image": "pixel_values"},
+            buffer_keys=["pixel_position_ids"],
+            out_hidden_size=self.config.text_config.hidden_size,
+        )
+
+    def get_input_modality(self, mm_kwargs: dict[str, Any]) -> str:
+        return "image"
+
+    def get_max_frames_per_video(self) -> int:
+        return 1
+
+    def get_encoder_cudagraph_budget_range(
+        self,
+        vllm_config: VllmConfig,
+    ) -> tuple[int, int]:
+        del vllm_config
+        max_tokens = self.config.vision_config.default_output_length
+        # Gemma4 inputs are padded to max_tokens * pooling_kernel_size**2
+        # patches regardless of the number of valid output tokens. Capturing
+        # one image per graph avoids running the full padded tower for unused
+        # batch rows.
+        return (max_tokens, max_tokens)
+
+    def get_encoder_cudagraph_num_items(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> int:
+        return mm_kwargs["pixel_values"].shape[0]
+
+    def get_encoder_cudagraph_per_item_output_tokens(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> list[int]:
+        pixel_position_ids = mm_kwargs["pixel_position_ids"]
+        padding = (pixel_position_ids == -1).all(dim=-1)
+        valid_patches = (~padding).sum(dim=-1)
+        pooling_k2 = self.config.vision_config.pooling_kernel_size**2
+        return (valid_patches // pooling_k2).tolist()
+
+    def get_encoder_cudagraph_per_item_input_sizes(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> list[int]:
+        pixel_position_ids = mm_kwargs["pixel_position_ids"]
+        padding = (pixel_position_ids == -1).all(dim=-1)
+        return (~padding).sum(dim=-1).tolist()
+
+    def select_encoder_cudagraph_items(
+        self,
+        mm_kwargs: dict[str, Any],
+        indices: list[int],
+    ) -> dict[str, Any]:
+        pixel_values = mm_kwargs["pixel_values"]
+        pixel_position_ids = mm_kwargs["pixel_position_ids"]
+
+        if indices:
+            pixel_values = pixel_values[indices]
+            pixel_position_ids = pixel_position_ids[indices]
+        else:
+            pixel_values = pixel_values[:0]
+            pixel_position_ids = pixel_position_ids[:0]
+
+        pooling_k2 = self.config.vision_config.pooling_kernel_size**2
+        capture_patches = self.config.vision_config.default_output_length * pooling_k2
+        input_patches = pixel_values.shape[1]
+        if input_patches < capture_patches:
+            padded_values = pixel_values.new_zeros(
+                pixel_values.shape[0],
+                capture_patches,
+                pixel_values.shape[2],
+            )
+            padded_values[:, :input_patches].copy_(pixel_values)
+            pixel_values = padded_values
+
+            padded_positions = pixel_position_ids.new_full(
+                (pixel_position_ids.shape[0], capture_patches, 2),
+                -1,
+            )
+            padded_positions[:, :input_patches].copy_(pixel_position_ids)
+            pixel_position_ids = padded_positions
+
+        return {
+            "pixel_values": pixel_values,
+            "pixel_position_ids": pixel_position_ids,
+        }
+
+    def prepare_encoder_cudagraph_capture_inputs(
+        self,
+        token_budget: int,
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        from vllm.v1.worker.encoder_cudagraph_defs import (
+            EncoderCudaGraphCaptureInputs,
+        )
+
+        del max_frames_per_batch
+        vision_config = self.config.vision_config
+        pooling_kernel_size = vision_config.pooling_kernel_size
+        pooling_k2 = pooling_kernel_size**2
+        max_tokens = vision_config.default_output_length
+        max_patches = max_tokens * pooling_k2
+        if token_budget > max_batch_size * max_tokens:
+            raise ValueError(
+                f"Encoder CUDA graph budget {token_budget} exceeds Gemma4 "
+                f"capture capacity {max_batch_size * max_tokens}."
+            )
+
+        patch_pixels = 3 * vision_config.patch_size**2
+        pixel_values = torch.randn(
+            max_batch_size,
+            max_patches,
+            patch_pixels,
+            device=device,
+            dtype=dtype,
+        )
+        pixel_position_ids = torch.full(
+            (max_batch_size, max_patches, 2),
+            -1,
+            device=device,
+            dtype=torch.long,
+        )
+
+        remaining_tokens = token_budget
+        for i in range(max_batch_size):
+            item_tokens = min(max_tokens, remaining_tokens)
+            remaining_tokens -= item_tokens
+            if item_tokens == 0:
+                continue
+
+            width = item_tokens * pooling_kernel_size
+            x = torch.arange(width, device=device).repeat(pooling_kernel_size)
+            y = torch.arange(pooling_kernel_size, device=device).repeat_interleave(
+                width
+            )
+            valid_patches = item_tokens * pooling_k2
+            pixel_position_ids[i, :valid_patches] = torch.stack((x, y), dim=-1)
+
+        mm_kwargs = {
+            "pixel_values": pixel_values,
+            "pixel_position_ids": pixel_position_ids,
+        }
+        return EncoderCudaGraphCaptureInputs(
+            mm_kwargs=mm_kwargs,
+            buffers={"pixel_position_ids": pixel_position_ids},
+        )
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self,
+        mm_kwargs: dict[str, Any],
+        max_batch_size: int,
+        max_frames_per_batch: int,
+    ):
+        from vllm.v1.worker.encoder_cudagraph_defs import (
+            EncoderCudaGraphReplayBuffers,
+        )
+
+        del max_batch_size, max_frames_per_batch
+        return EncoderCudaGraphReplayBuffers(
+            buffers={"pixel_position_ids": mm_kwargs["pixel_position_ids"]}
+        )
+
+    def encoder_cudagraph_forward(
+        self,
+        mm_kwargs: dict[str, Any],
+        buffers: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        pixel_values = mm_kwargs["pixel_values"]
+        pixel_position_ids = buffers["pixel_position_ids"]
+
+        # Gemma4VisionModel.forward() ends with
+        # hidden_states[pooler_mask], whose data-dependent output allocation
+        # is not permitted during CUDA graph capture. Keep the pooler's static
+        # [batch, max_tokens, hidden] output here. Valid pooled positions are
+        # contiguous at the start of each image, and the graph manager slices
+        # the returned flat tensor using the per-image valid-token counts.
+        vision_tower = self.vision_tower
+        pooling_kernel_size = vision_tower.config.pooling_kernel_size
+        output_length = pixel_values.shape[-2] // (
+            pooling_kernel_size * pooling_kernel_size
+        )
+        padding_positions = (pixel_position_ids == -1).all(dim=-1)
+        inputs_embeds = vision_tower.patch_embedder(
+            pixel_values,
+            pixel_position_ids,
+            padding_positions,
+        )
+        encoder_output = vision_tower.encoder(
+            inputs_embeds=inputs_embeds,
+            attention_mask=~padding_positions,
+            pixel_position_ids=pixel_position_ids,
+        )
+        hidden_states, _ = vision_tower.pooler(
+            hidden_states=encoder_output.last_hidden_state,
+            pixel_position_ids=pixel_position_ids,
+            padding_positions=padding_positions,
+            output_length=output_length,
+        )
+        if vision_tower.config.standardize:
+            hidden_states = (
+                hidden_states - vision_tower.std_bias.float()
+            ) * vision_tower.std_scale.float()
+        hidden_states = hidden_states.to(inputs_embeds.dtype).flatten(end_dim=1)
+
+        target_dtype = self.embed_vision.embedding_projection.weight.dtype
+        return self.embed_vision(
+            inputs_embeds=hidden_states.unsqueeze(0).to(target_dtype)
+        ).squeeze(0)
+
+    def encoder_eager_forward(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        image_input = self._parse_and_validate_image_input(**mm_kwargs)
+        assert image_input is not None
+        return torch.cat(self._process_image_input(image_input), dim=0)
 
     def embed_input_ids(
         self,
