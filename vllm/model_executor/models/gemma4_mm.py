@@ -15,13 +15,16 @@ reason about temporal order.
 """
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+import os
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Annotated, Any, Literal
 
 import numpy as np
 import torch
 from PIL import Image as PILImage
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AutoModel, BatchFeature
 from transformers.models.gemma4 import (
     Gemma4Config,
@@ -85,6 +88,21 @@ logger = init_logger(__name__)
 _SUPPORTED_SOFT_TOKENS = (70, 140, 280, 560, 1120)
 _VIDEO_MAX_SOFT_TOKENS = 70  # soft tokens per video frame (vs 280 for images)
 _VIDEO_MAX_FRAMES = 32  # max sampled frames per video
+
+_GEMMA4_VISION_USE_CUDNN_SDPA_ENV = "VLLM_GEMMA4_VISION_USE_CUDNN_SDPA"
+
+
+def _get_gemma4_vision_use_cudnn_sdpa() -> bool:
+    return os.getenv(_GEMMA4_VISION_USE_CUDNN_SDPA_ENV, "0").lower() in ("1", "true")
+
+
+@contextmanager
+def _gemma4_vision_attention_backend(use_cudnn_sdpa: bool) -> Iterator[None]:
+    if use_cudnn_sdpa:
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            yield
+    else:
+        yield
 
 
 def _get_max_soft_tokens(
@@ -963,6 +981,10 @@ class Gemma4ForConditionalGeneration(
                 config.vision_config, config.text_config
             )
 
+        self._vision_use_cudnn_sdpa = _get_gemma4_vision_use_cudnn_sdpa()
+        if self._vision_use_cudnn_sdpa:
+            logger.info("Using cuDNN SDPA for Gemma 4 vision attention.")
+
         # ---- Audio tower (variants with audio_config) ----
         if config.audio_config is not None:
             with self._mark_tower_model(vllm_config, "audio"):
@@ -1155,7 +1177,8 @@ class Gemma4ForConditionalGeneration(
             max_patches = pv.shape[1]
             output_length = max_patches // pooling_k2
 
-            vt_output = vt(pv, pp, output_length=output_length)
+            with _gemma4_vision_attention_backend(self._vision_use_cudnn_sdpa):
+                vt_output = vt(pv, pp, output_length=output_length)
             # last_hidden_state: (num_valid_tokens, hidden_size)
             # — already flat with padding stripped by the vision tower
             per_image_features.append(vt_output.last_hidden_state)
@@ -1489,11 +1512,12 @@ class Gemma4ForConditionalGeneration(
             pixel_position_ids,
             padding_positions,
         )
-        encoder_output = vision_tower.encoder(
-            inputs_embeds=inputs_embeds,
-            attention_mask=~padding_positions,
-            pixel_position_ids=pixel_position_ids,
-        )
+        with _gemma4_vision_attention_backend(self._vision_use_cudnn_sdpa):
+            encoder_output = vision_tower.encoder(
+                inputs_embeds=inputs_embeds,
+                attention_mask=~padding_positions,
+                pixel_position_ids=pixel_position_ids,
+            )
         hidden_states, _ = vision_tower.pooler(
             hidden_states=encoder_output.last_hidden_state,
             pixel_position_ids=pixel_position_ids,
