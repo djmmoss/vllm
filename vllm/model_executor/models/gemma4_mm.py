@@ -65,6 +65,7 @@ from vllm.multimodal.processing.processor import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.triton_utils import tl, triton
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .interfaces import (
@@ -103,6 +104,159 @@ def _gemma4_vision_attention_backend(use_cudnn_sdpa: bool) -> Iterator[None]:
             yield
     else:
         yield
+
+
+@triton.jit
+def _gemma4_vision_rmsnorm_clip_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    clip_min_ptr,
+    clip_max_ptr,
+    n_cols: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_cols
+    input_row = input_ptr + row * n_cols
+    output_row = output_ptr + row * n_cols
+
+    values = tl.load(input_row + offsets, mask=mask, other=0.0).to(tl.float32)
+    weights = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    mean_square = tl.sum(values * values, axis=0) / n_cols
+    values = values * tl.rsqrt(mean_square + eps) * weights
+
+    clip_min = tl.load(clip_min_ptr).to(tl.float32)
+    clip_max = tl.load(clip_max_ptr).to(tl.float32)
+    values = tl.maximum(tl.minimum(values, clip_max), clip_min)
+    tl.store(output_row + offsets, values, mask=mask)
+
+
+def _gemma4_vision_rmsnorm_clip(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    clip_min: torch.Tensor,
+    clip_max: torch.Tensor,
+) -> torch.Tensor:
+    hidden_size = hidden_states.shape[-1]
+    output = torch.empty_like(hidden_states)
+    if output.numel() == 0:
+        return output
+
+    block_size = triton.next_power_of_2(hidden_size)
+    num_rows = hidden_states.numel() // hidden_size
+    num_warps = 4 if block_size <= 1024 else 8
+    _gemma4_vision_rmsnorm_clip_kernel[(num_rows,)](
+        hidden_states,
+        weight,
+        output,
+        clip_min,
+        clip_max,
+        n_cols=hidden_size,
+        eps=eps,
+        BLOCK_SIZE=block_size,
+        num_warps=num_warps,
+    )
+    return output
+
+
+class _Gemma4SharedInputClip:
+    def __init__(self, projections: Sequence[nn.Module]) -> None:
+        self.bounds = tuple(
+            (projection.input_min, projection.input_max) for projection in projections
+        )
+
+    @property
+    def clip_min(self) -> torch.Tensor:
+        return self.bounds[0][0]
+
+    @property
+    def clip_max(self) -> torch.Tensor:
+        return self.bounds[0][1]
+
+    def validate(self) -> bool:
+        clip_min, clip_max = self.bounds[0]
+        return all(
+            torch.equal(clip_min, other_min) and torch.equal(clip_max, other_max)
+            for other_min, other_max in self.bounds[1:]
+        )
+
+
+class _Gemma4OutputClippedLinear(nn.Module):
+    def __init__(self, linear: nn.Module) -> None:
+        super().__init__()
+        self.linear = linear.linear
+        self.register_buffer("input_min", linear.input_min)
+        self.register_buffer("input_max", linear.input_max)
+        self.register_buffer("output_min", linear.output_min)
+        self.register_buffer("output_max", linear.output_max)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.linear(hidden_states)
+        return torch.clamp(hidden_states, self.output_min, self.output_max)
+
+
+class _Gemma4RMSNormClip(nn.Module):
+    def __init__(
+        self,
+        rms_norm: nn.Module,
+        shared_input_clip: _Gemma4SharedInputClip,
+    ) -> None:
+        super().__init__()
+        self.weight = rms_norm.weight
+        self.eps = rms_norm.eps
+        self.shared_input_clip = shared_input_clip
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not (
+            hidden_states.is_cuda
+            and hidden_states.is_contiguous()
+            and hidden_states.dtype in (torch.float16, torch.bfloat16)
+        ):
+            raise RuntimeError(
+                "Fused Gemma 4 vision RMSNorm + clipping requires a contiguous "
+                "CUDA FP16 or BF16 input."
+            )
+        return _gemma4_vision_rmsnorm_clip(
+            hidden_states,
+            self.weight,
+            self.eps,
+            self.shared_input_clip.clip_min,
+            self.shared_input_clip.clip_max,
+        )
+
+
+def _enable_gemma4_vision_triton_rmsnorm_clip(
+    vision_tower: nn.Module,
+) -> list[_Gemma4SharedInputClip]:
+    shared_clips = []
+    for layer in vision_tower.encoder.layers:
+        attention = layer.self_attn
+        attention_clip = _Gemma4SharedInputClip(
+            (attention.q_proj, attention.k_proj, attention.v_proj)
+        )
+        attention.q_proj = _Gemma4OutputClippedLinear(attention.q_proj)
+        attention.k_proj = _Gemma4OutputClippedLinear(attention.k_proj)
+        attention.v_proj = _Gemma4OutputClippedLinear(attention.v_proj)
+        layer.input_layernorm = _Gemma4RMSNormClip(
+            layer.input_layernorm,
+            attention_clip,
+        )
+        shared_clips.append(attention_clip)
+
+        mlp = layer.mlp
+        mlp_clip = _Gemma4SharedInputClip((mlp.gate_proj, mlp.up_proj))
+        mlp.gate_proj = _Gemma4OutputClippedLinear(mlp.gate_proj)
+        mlp.up_proj = _Gemma4OutputClippedLinear(mlp.up_proj)
+        layer.pre_feedforward_layernorm = _Gemma4RMSNormClip(
+            layer.pre_feedforward_layernorm,
+            mlp_clip,
+        )
+        shared_clips.append(mlp_clip)
+    return shared_clips
 
 
 def _get_max_soft_tokens(
@@ -984,6 +1138,15 @@ class Gemma4ForConditionalGeneration(
         self._vision_use_cudnn_sdpa = _get_gemma4_vision_use_cudnn_sdpa()
         if self._vision_use_cudnn_sdpa:
             logger.info("Using cuDNN SDPA for Gemma 4 vision attention.")
+        self._vision_rmsnorm_clip_states: list[_Gemma4SharedInputClip] = []
+        if config.vision_config.use_clipped_linears:
+            self._vision_rmsnorm_clip_states = (
+                _enable_gemma4_vision_triton_rmsnorm_clip(self.vision_tower)
+            )
+            logger.info(
+                "Using fused Triton RMSNorm + shared input clipping for "
+                "Gemma 4 vision attention and MLP projections."
+            )
 
         # ---- Audio tower (variants with audio_config) ----
         if config.audio_config is not None:
@@ -1703,7 +1866,15 @@ class Gemma4ForConditionalGeneration(
             self,
             ignore_unexpected_prefixes=ignore_prefixes,
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        for group_index, shared_clip in enumerate(self._vision_rmsnorm_clip_states):
+            if not shared_clip.validate():
+                raise ValueError(
+                    "Fused Gemma 4 vision RMSNorm + clipping requires equal "
+                    "input clipping bounds for every projection in group "
+                    f"{group_index}."
+                )
+        return loaded_weights
 
     # ------------------------------------------------------------------ #
     # LoRA / multimodal mapping
