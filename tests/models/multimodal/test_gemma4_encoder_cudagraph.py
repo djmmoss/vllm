@@ -58,14 +58,13 @@ def test_gemma4_encoder_cudagraph_item_metadata() -> None:
 
     config = model.get_encoder_cudagraph_config()
     assert config.modalities == ["image"]
-    assert config.input_key_by_modality == {"image": "pixel_values"}
-    assert config.buffer_keys == ["pixel_position_ids"]
+    assert config.buffer_keys == ["pixel_values", "pixel_position_ids"]
     assert config.out_hidden_size == 16
     assert model.get_input_modality(mm_kwargs) == "image"
     assert model.get_encoder_cudagraph_budget_range(cast(VllmConfig, None)) == (4, 4)
-    assert model.get_encoder_cudagraph_num_items(mm_kwargs) == 2
-    assert model.get_encoder_cudagraph_per_item_input_sizes(mm_kwargs) == [18, 9]
-    assert model.get_encoder_cudagraph_per_item_output_tokens(mm_kwargs) == [2, 1]
+    specs = model.get_encoder_cudagraph_item_specs(mm_kwargs)
+    assert [spec.input_size for spec in specs] == [18, 9]
+    assert [spec.output_tokens for spec in specs] == [2, 1]
 
 
 def test_gemma4_encoder_cudagraph_select_pads_to_capture_shape() -> None:
@@ -98,21 +97,20 @@ def test_gemma4_encoder_cudagraph_capture_and_replay_buffers() -> None:
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
     )
-    assert capture.mm_kwargs["pixel_values"].shape == (1, 36, 12)
-    assert capture.mm_kwargs["pixel_values"].dtype == torch.bfloat16
-    assert capture.mm_kwargs["pixel_position_ids"].shape == (1, 36, 2)
-    assert model.get_encoder_cudagraph_per_item_output_tokens(capture.mm_kwargs) == [4]
-    assert capture.buffers == {
-        "pixel_position_ids": capture.mm_kwargs["pixel_position_ids"]
-    }
+    assert capture.values["pixel_values"].shape == (1, 36, 12)
+    assert capture.values["pixel_values"].dtype == torch.bfloat16
+    assert capture.values["pixel_position_ids"].shape == (1, 36, 2)
+    specs = model.get_encoder_cudagraph_item_specs(capture.values)
+    assert [spec.output_tokens for spec in specs] == [4]
 
     replay = model.prepare_encoder_cudagraph_replay_buffers(
-        capture.mm_kwargs,
+        capture.values,
         max_batch_size=1,
         max_frames_per_batch=0,
     )
-    assert replay.buffers == {
-        "pixel_position_ids": capture.mm_kwargs["pixel_position_ids"]
+    assert replay.values == {
+        "pixel_values": capture.values["pixel_values"],
+        "pixel_position_ids": capture.values["pixel_position_ids"],
     }
 
 

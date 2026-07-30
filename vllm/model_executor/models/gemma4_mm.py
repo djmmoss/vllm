@@ -1491,9 +1491,7 @@ class Gemma4ForConditionalGeneration(
                     pp_tensor,
                     pad_tensor,
                 ).to(self.model_dtype)
-                with _gemma4_vision_attention_backend(
-                    self._vision_use_cudnn_sdpa
-                ):
+                with _gemma4_vision_attention_backend(self._vision_use_cudnn_sdpa):
                     encoder_outputs = vt.encoder(
                         inputs_embeds=inputs_embeds,
                         attention_mask=~pad_tensor,
@@ -1724,8 +1722,7 @@ class Gemma4ForConditionalGeneration(
 
         return EncoderCudaGraphConfig(
             modalities=["image"],
-            input_key_by_modality={"image": "pixel_values"},
-            buffer_keys=["pixel_position_ids"],
+            buffer_keys=["pixel_values", "pixel_position_ids"],
             out_hidden_size=self.config.text_config.hidden_size,
         )
 
@@ -1747,29 +1744,23 @@ class Gemma4ForConditionalGeneration(
         # batch rows.
         return (max_tokens, max_tokens)
 
-    def get_encoder_cudagraph_num_items(
+    def get_encoder_cudagraph_item_specs(
         self,
         mm_kwargs: dict[str, Any],
-    ) -> int:
-        return mm_kwargs["pixel_values"].shape[0]
+    ):
+        from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
 
-    def get_encoder_cudagraph_per_item_output_tokens(
-        self,
-        mm_kwargs: dict[str, Any],
-    ) -> list[int]:
         pixel_position_ids = mm_kwargs["pixel_position_ids"]
         padding = (pixel_position_ids == -1).all(dim=-1)
         valid_patches = (~padding).sum(dim=-1)
         pooling_k2 = self.config.vision_config.pooling_kernel_size**2
-        return (valid_patches // pooling_k2).tolist()
-
-    def get_encoder_cudagraph_per_item_input_sizes(
-        self,
-        mm_kwargs: dict[str, Any],
-    ) -> list[int]:
-        pixel_position_ids = mm_kwargs["pixel_position_ids"]
-        padding = (pixel_position_ids == -1).all(dim=-1)
-        return (~padding).sum(dim=-1).tolist()
+        return [
+            EncoderItemSpec(
+                input_size=int(input_size),
+                output_tokens=int(input_size) // pooling_k2,
+            )
+            for input_size in valid_patches
+        ]
 
     def select_encoder_cudagraph_items(
         self,
@@ -1817,12 +1808,13 @@ class Gemma4ForConditionalGeneration(
         max_frames_per_batch: int,
         device: torch.device,
         dtype: torch.dtype,
+        path: str = "default",
     ):
         from vllm.v1.worker.encoder_cudagraph_defs import (
             EncoderCudaGraphCaptureInputs,
         )
 
-        del max_frames_per_batch
+        del max_frames_per_batch, path
         vision_config = self.config.vision_config
         pooling_kernel_size = vision_config.pooling_kernel_size
         pooling_k2 = pooling_kernel_size**2
@@ -1864,13 +1856,11 @@ class Gemma4ForConditionalGeneration(
             valid_patches = item_tokens * pooling_k2
             pixel_position_ids[i, :valid_patches] = torch.stack((x, y), dim=-1)
 
-        mm_kwargs = {
-            "pixel_values": pixel_values,
-            "pixel_position_ids": pixel_position_ids,
-        }
         return EncoderCudaGraphCaptureInputs(
-            mm_kwargs=mm_kwargs,
-            buffers={"pixel_position_ids": pixel_position_ids},
+            values={
+                "pixel_values": pixel_values,
+                "pixel_position_ids": pixel_position_ids,
+            }
         )
 
     def prepare_encoder_cudagraph_replay_buffers(
@@ -1878,23 +1868,28 @@ class Gemma4ForConditionalGeneration(
         mm_kwargs: dict[str, Any],
         max_batch_size: int,
         max_frames_per_batch: int,
+        path: str = "default",
     ):
         from vllm.v1.worker.encoder_cudagraph_defs import (
             EncoderCudaGraphReplayBuffers,
         )
 
-        del max_batch_size, max_frames_per_batch
+        del max_batch_size, max_frames_per_batch, path
         return EncoderCudaGraphReplayBuffers(
-            buffers={"pixel_position_ids": mm_kwargs["pixel_position_ids"]}
+            values={
+                "pixel_values": mm_kwargs["pixel_values"],
+                "pixel_position_ids": mm_kwargs["pixel_position_ids"],
+            }
         )
 
     def encoder_cudagraph_forward(
         self,
-        mm_kwargs: dict[str, Any],
-        buffers: dict[str, torch.Tensor],
+        values: dict[str, torch.Tensor],
+        path: str = "default",
     ) -> torch.Tensor:
-        pixel_values = mm_kwargs["pixel_values"]
-        pixel_position_ids = buffers["pixel_position_ids"]
+        del path
+        pixel_values = values["pixel_values"]
+        pixel_position_ids = values["pixel_position_ids"]
 
         # Gemma4VisionModel.forward() ends with
         # hidden_states[pooler_mask], whose data-dependent output allocation
@@ -1931,15 +1926,16 @@ class Gemma4ForConditionalGeneration(
             ) * vision_tower.std_scale.float()
         hidden_states = hidden_states.to(inputs_embeds.dtype).flatten(end_dim=1)
 
-        target_dtype = self.embed_vision.embedding_projection.weight.dtype
         return self.embed_vision(
-            inputs_embeds=hidden_states.unsqueeze(0).to(target_dtype)
+            inputs_embeds=hidden_states.unsqueeze(0).to(self.model_dtype)
         ).squeeze(0)
 
     def encoder_eager_forward(
         self,
         mm_kwargs: dict[str, Any],
+        path: str = "default",
     ) -> torch.Tensor:
+        del path
         image_input = self._parse_and_validate_image_input(**mm_kwargs)
         assert image_input is not None
         return torch.cat(self._process_image_input(image_input), dim=0)
