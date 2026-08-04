@@ -9,8 +9,8 @@ from torch import nn
 
 from vllm.model_executor.models.gemma4_mm import (
     _convert_gemma4_vision_rmsnorm,
+    _gemma4_vision_gelu_mul_clip,
     _Gemma4LinearWithoutOutputClip,
-    _Gemma4OutputClippedLinear,
     _Gemma4RMSNormClip,
     _Gemma4SharedInputClip,
 )
@@ -59,20 +59,6 @@ def test_gemma4_shared_input_clip_validation() -> None:
 
     projections[1].input_max.fill_(1.5)
     assert not shared_clip.validate()
-
-
-def test_gemma4_output_clipped_linear_requires_preclipped_input() -> None:
-    projection = _ClippedLinear(2, -2.0, 2.0)
-    with torch.no_grad():
-        projection.linear.weight.copy_(torch.eye(2))
-    wrapped_projection = _Gemma4OutputClippedLinear(projection)
-    hidden_states = torch.tensor([[-4.0, 4.0]])
-
-    torch.testing.assert_close(
-        wrapped_projection(hidden_states),
-        torch.tensor([[-3.0, 3.0]]),
-    )
-    torch.testing.assert_close(projection(hidden_states), torch.tensor([[-2.0, 2.0]]))
 
 
 @pytest.mark.parametrize(
@@ -235,5 +221,58 @@ def test_gemma4_vision_fused_input_clip_rmsnorm_cuda_graph(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         replayed = fused_norm(hidden_states)
+    graph.replay()
+    torch.testing.assert_close(replayed, expected, atol=0.015625, rtol=0.01)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_gemma4_vision_fused_gelu_mul_clip_cuda_graph() -> None:
+    torch.manual_seed(0)
+    gate = 8 * torch.randn(
+        2520,
+        4304,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    up = 8 * torch.randn_like(gate)
+    gate_min = torch.tensor(-2.5, device="cuda", dtype=torch.bfloat16)
+    gate_max = torch.tensor(2.25, device="cuda", dtype=torch.bfloat16)
+    up_min = torch.tensor(-3.0, device="cuda", dtype=torch.bfloat16)
+    up_max = torch.tensor(2.75, device="cuda", dtype=torch.bfloat16)
+    output_min = torch.tensor(-4.0, device="cuda", dtype=torch.bfloat16)
+    output_max = torch.tensor(3.5, device="cuda", dtype=torch.bfloat16)
+    expected = torch.clamp(
+        torch.nn.functional.gelu(
+            torch.clamp(gate, gate_min, gate_max), approximate="tanh"
+        )
+        * torch.clamp(up, up_min, up_max),
+        output_min,
+        output_max,
+    )
+
+    actual = _gemma4_vision_gelu_mul_clip(
+        gate,
+        up,
+        gate_min,
+        gate_max,
+        up_min,
+        up_max,
+        output_min,
+        output_max,
+    )
+    torch.testing.assert_close(actual, expected, atol=0.015625, rtol=0.01)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = _gemma4_vision_gelu_mul_clip(
+            gate,
+            up,
+            gate_min,
+            gate_max,
+            up_min,
+            up_max,
+            output_min,
+            output_max,
+        )
     graph.replay()
     torch.testing.assert_close(replayed, expected, atol=0.015625, rtol=0.01)

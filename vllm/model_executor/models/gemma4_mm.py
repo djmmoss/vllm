@@ -67,7 +67,7 @@ from vllm.multimodal.processing.processor import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, tldevice, triton
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .interfaces import (
@@ -172,6 +172,47 @@ def _gemma4_vision_rmsnorm_kernel(
     tl.store(output_row + offsets, values, mask=mask)
 
 
+@triton.jit
+def _gemma4_vision_gelu_mul_clip_kernel(
+    gate_ptr,
+    up_ptr,
+    output_ptr,
+    gate_min_ptr,
+    gate_max_ptr,
+    up_min_ptr,
+    up_max_ptr,
+    output_min_ptr,
+    output_max_ptr,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    gate = tl.load(gate_ptr + offsets, mask=mask).to(tl.float32)
+    up = tl.load(up_ptr + offsets, mask=mask).to(tl.float32)
+
+    gate_min = tl.load(gate_min_ptr).to(tl.float32)
+    gate_max = tl.load(gate_max_ptr).to(tl.float32)
+    up_min = tl.load(up_min_ptr).to(tl.float32)
+    up_max = tl.load(up_max_ptr).to(tl.float32)
+    gate = tl.maximum(tl.minimum(gate, gate_max), gate_min)
+    up = tl.maximum(tl.minimum(up, up_max), up_min)
+
+    gelu = (
+        0.5
+        * gate
+        * (
+            1.0
+            + tldevice.tanh(0.7978845608028654 * (gate + 0.044715 * gate * gate * gate))
+        )
+    )
+    values = gelu * up
+    output_min = tl.load(output_min_ptr).to(tl.float32)
+    output_max = tl.load(output_max_ptr).to(tl.float32)
+    values = tl.maximum(tl.minimum(values, output_max), output_min)
+    tl.store(output_ptr + offsets, values, mask=mask)
+
+
 def _gemma4_vision_rmsnorm_clip(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -232,6 +273,36 @@ def _gemma4_vision_rmsnorm(
     return output
 
 
+def _gemma4_vision_gelu_mul_clip(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    gate_min: torch.Tensor,
+    gate_max: torch.Tensor,
+    up_min: torch.Tensor,
+    up_max: torch.Tensor,
+    output_min: torch.Tensor,
+    output_max: torch.Tensor,
+) -> torch.Tensor:
+    output = torch.empty_like(gate)
+    if output.numel() == 0:
+        return output
+    _gemma4_vision_gelu_mul_clip_kernel[(triton.cdiv(output.numel(), 1024),)](
+        gate,
+        up,
+        output,
+        gate_min,
+        gate_max,
+        up_min,
+        up_max,
+        output_min,
+        output_max,
+        n_elements=output.numel(),
+        BLOCK_SIZE=1024,
+        num_warps=4,
+    )
+    return output
+
+
 class _Gemma4SharedInputClip:
     def __init__(self, projections: Sequence[nn.Module]) -> None:
         self.bounds = tuple(
@@ -254,20 +325,6 @@ class _Gemma4SharedInputClip:
         )
 
 
-class _Gemma4OutputClippedLinear(nn.Module):
-    def __init__(self, linear: nn.Module) -> None:
-        super().__init__()
-        self.linear = linear.linear
-        self.register_buffer("input_min", linear.input_min)
-        self.register_buffer("input_max", linear.input_max)
-        self.register_buffer("output_min", linear.output_min)
-        self.register_buffer("output_max", linear.output_max)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.linear(hidden_states)
-        return torch.clamp(hidden_states, self.output_min, self.output_max)
-
-
 class _Gemma4LinearWithoutOutputClip(nn.Module):
     def __init__(self, linear: nn.Module, *, clip_input: bool) -> None:
         super().__init__()
@@ -286,6 +343,35 @@ class _Gemma4LinearWithoutOutputClip(nn.Module):
                 self.input_max,
             )
         return self.linear(hidden_states)
+
+
+class _Gemma4VisionMLP(nn.Module):
+    def __init__(self, mlp: nn.Module) -> None:
+        super().__init__()
+        if mlp.config.hidden_activation != "gelu_pytorch_tanh":
+            raise ValueError(
+                "Fused Gemma 4 vision MLP requires gelu_pytorch_tanh, got "
+                f"{mlp.config.hidden_activation}."
+            )
+        self.config = mlp.config
+        self.gate_proj = _Gemma4LinearWithoutOutputClip(mlp.gate_proj, clip_input=False)
+        self.up_proj = _Gemma4LinearWithoutOutputClip(mlp.up_proj, clip_input=False)
+        self.down_proj = _Gemma4LinearWithoutOutputClip(mlp.down_proj, clip_input=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate = self.gate_proj(hidden_states)
+        up = self.up_proj(hidden_states)
+        hidden_states = _gemma4_vision_gelu_mul_clip(
+            gate,
+            up,
+            self.gate_proj.output_min,
+            self.gate_proj.output_max,
+            self.up_proj.output_min,
+            self.up_proj.output_max,
+            self.down_proj.input_min,
+            self.down_proj.input_max,
+        )
+        return self.down_proj(hidden_states)
 
 
 class _Gemma4RMSNormClip(nn.Module):
@@ -409,15 +495,13 @@ def _enable_gemma4_vision_triton_rmsnorm_clip(
 
         mlp = layer.mlp
         mlp_clip = _Gemma4SharedInputClip((mlp.gate_proj, mlp.up_proj))
-        mlp.gate_proj = _Gemma4OutputClippedLinear(mlp.gate_proj)
-        mlp.up_proj = _Gemma4OutputClippedLinear(mlp.up_proj)
-        mlp.down_proj = _Gemma4LinearWithoutOutputClip(mlp.down_proj, clip_input=True)
         layer.pre_feedforward_layernorm = _Gemma4RMSNormClip(
             layer.pre_feedforward_layernorm,
             mlp_clip,
         )
+        layer.mlp = _Gemma4VisionMLP(mlp)
         layer.post_feedforward_layernorm = _convert_gemma4_vision_rmsnorm(
-            layer.post_feedforward_layernorm, mlp.down_proj
+            layer.post_feedforward_layernorm, layer.mlp.down_proj
         )
         shared_clips.append(mlp_clip)
     return shared_clips
