@@ -15,13 +15,16 @@ reason about temporal order.
 """
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+import types
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal
 
 import numpy as np
 import torch
 from PIL import Image as PILImage
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AutoModel, BatchFeature
 from transformers.models.gemma4 import (
     Gemma4Config,
@@ -33,6 +36,7 @@ from transformers.models.gemma4.configuration_gemma4 import (
     Gemma4TextConfig,
 )
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.model import get_served_model_name
 from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
@@ -67,6 +71,7 @@ from vllm.multimodal.processing.processor import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.triton_utils import tl, tldevice, triton
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .interfaces import (
@@ -100,6 +105,443 @@ logger = init_logger(__name__)
 _SUPPORTED_SOFT_TOKENS = (70, 140, 280, 560, 1120)
 _VIDEO_MAX_SOFT_TOKENS = 70  # soft tokens per video frame (vs 280 for images)
 _VIDEO_MAX_FRAMES = 32  # max sampled frames per video
+
+
+@contextmanager
+def _gemma4_vision_attention_backend(use_cudnn_sdpa: bool) -> Iterator[None]:
+    if use_cudnn_sdpa:
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            yield
+    else:
+        yield
+
+
+@triton.jit
+def _gemma4_vision_rmsnorm_clip_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    clip_min_ptr,
+    clip_max_ptr,
+    n_cols: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_cols
+    input_row = input_ptr + row * n_cols
+    output_row = output_ptr + row * n_cols
+
+    values = tl.load(input_row + offsets, mask=mask, other=0.0).to(tl.float32)
+    weights = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    mean_square = tl.sum(values * values, axis=0) / n_cols
+    values = values * tl.rsqrt(mean_square + eps) * weights
+
+    clip_min = tl.load(clip_min_ptr).to(tl.float32)
+    clip_max = tl.load(clip_max_ptr).to(tl.float32)
+    values = tl.maximum(tl.minimum(values, clip_max), clip_min)
+    tl.store(output_row + offsets, values, mask=mask)
+
+
+@triton.jit
+def _gemma4_vision_rmsnorm_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    residual_ptr,
+    input_clip_min_ptr,
+    input_clip_max_ptr,
+    n_cols: tl.constexpr,
+    eps: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    HAS_INPUT_CLIP: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_cols
+    input_row = input_ptr + row * n_cols
+    output_row = output_ptr + row * n_cols
+
+    values = tl.load(input_row + offsets, mask=mask, other=0.0).to(tl.float32)
+    if HAS_INPUT_CLIP:
+        input_clip_min = tl.load(input_clip_min_ptr).to(tl.float32)
+        input_clip_max = tl.load(input_clip_max_ptr).to(tl.float32)
+        values = tl.maximum(tl.minimum(values, input_clip_max), input_clip_min)
+    mean_square = tl.sum(values * values, axis=0) / n_cols
+    values = values * tl.rsqrt(mean_square + eps)
+    if HAS_WEIGHT:
+        weights = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        values *= weights
+    if HAS_RESIDUAL:
+        values = values.to(output_ptr.dtype.element_ty).to(tl.float32)
+        residual_row = residual_ptr + row * n_cols
+        residual = tl.load(residual_row + offsets, mask=mask, other=0.0).to(tl.float32)
+        values += residual
+    tl.store(output_row + offsets, values, mask=mask)
+
+
+@triton.jit
+def _gemma4_vision_gelu_mul_clip_kernel(
+    gate_ptr,
+    up_ptr,
+    output_ptr,
+    gate_min_ptr,
+    gate_max_ptr,
+    up_min_ptr,
+    up_max_ptr,
+    output_min_ptr,
+    output_max_ptr,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    gate = tl.load(gate_ptr + offsets, mask=mask).to(tl.float32)
+    up = tl.load(up_ptr + offsets, mask=mask).to(tl.float32)
+
+    gate_min = tl.load(gate_min_ptr).to(tl.float32)
+    gate_max = tl.load(gate_max_ptr).to(tl.float32)
+    up_min = tl.load(up_min_ptr).to(tl.float32)
+    up_max = tl.load(up_max_ptr).to(tl.float32)
+    gate = tl.maximum(tl.minimum(gate, gate_max), gate_min)
+    up = tl.maximum(tl.minimum(up, up_max), up_min)
+
+    gelu = (
+        0.5
+        * gate
+        * (
+            1.0
+            + tldevice.tanh(0.7978845608028654 * (gate + 0.044715 * gate * gate * gate))
+        )
+    )
+    values = gelu * up
+    output_min = tl.load(output_min_ptr).to(tl.float32)
+    output_max = tl.load(output_max_ptr).to(tl.float32)
+    values = tl.maximum(tl.minimum(values, output_max), output_min)
+    tl.store(output_ptr + offsets, values, mask=mask)
+
+
+def _gemma4_vision_rmsnorm_clip(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    clip_min: torch.Tensor,
+    clip_max: torch.Tensor,
+) -> torch.Tensor:
+    hidden_size = hidden_states.shape[-1]
+    output = torch.empty_like(hidden_states)
+    if output.numel() == 0:
+        return output
+
+    block_size = triton.next_power_of_2(hidden_size)
+    num_rows = hidden_states.numel() // hidden_size
+    num_warps = 4 if block_size <= 1024 else 8
+    _gemma4_vision_rmsnorm_clip_kernel[(num_rows,)](
+        hidden_states,
+        weight,
+        output,
+        clip_min,
+        clip_max,
+        n_cols=hidden_size,
+        eps=eps,
+        BLOCK_SIZE=block_size,
+        num_warps=num_warps,
+    )
+    return output
+
+
+def _gemma4_vision_rmsnorm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor | None,
+    eps: float,
+    input_clip_min: torch.Tensor | None = None,
+    input_clip_max: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+) -> torch.Tensor:
+    hidden_size = hidden_states.shape[-1]
+    output = torch.empty_like(hidden_states)
+    if output.numel() == 0:
+        return output
+
+    block_size = triton.next_power_of_2(hidden_size)
+    num_rows = hidden_states.numel() // hidden_size
+    num_warps = 4 if block_size <= 1024 else 8
+    _gemma4_vision_rmsnorm_kernel[(num_rows,)](
+        hidden_states,
+        weight if weight is not None else hidden_states,
+        output,
+        residual if residual is not None else hidden_states,
+        input_clip_min if input_clip_min is not None else hidden_states,
+        input_clip_max if input_clip_max is not None else hidden_states,
+        n_cols=hidden_size,
+        eps=eps,
+        HAS_WEIGHT=weight is not None,
+        HAS_INPUT_CLIP=input_clip_min is not None,
+        HAS_RESIDUAL=residual is not None,
+        BLOCK_SIZE=block_size,
+        num_warps=num_warps,
+    )
+    return output
+
+
+def _gemma4_vision_gelu_mul_clip(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    gate_min: torch.Tensor,
+    gate_max: torch.Tensor,
+    up_min: torch.Tensor,
+    up_max: torch.Tensor,
+    output_min: torch.Tensor,
+    output_max: torch.Tensor,
+) -> torch.Tensor:
+    output = torch.empty_like(gate)
+    if output.numel() == 0:
+        return output
+    _gemma4_vision_gelu_mul_clip_kernel[(triton.cdiv(output.numel(), 1024),)](
+        gate,
+        up,
+        output,
+        gate_min,
+        gate_max,
+        up_min,
+        up_max,
+        output_min,
+        output_max,
+        n_elements=output.numel(),
+        BLOCK_SIZE=1024,
+        num_warps=4,
+    )
+    return output
+
+
+class _Gemma4SharedInputClip:
+    def __init__(self, projections: Sequence[nn.Module]) -> None:
+        self.bounds = tuple(
+            (projection.input_min, projection.input_max) for projection in projections
+        )
+
+    @property
+    def clip_min(self) -> torch.Tensor:
+        return self.bounds[0][0]
+
+    @property
+    def clip_max(self) -> torch.Tensor:
+        return self.bounds[0][1]
+
+    def validate(self) -> bool:
+        clip_min, clip_max = self.bounds[0]
+        return all(
+            torch.equal(clip_min, other_min) and torch.equal(clip_max, other_max)
+            for other_min, other_max in self.bounds[1:]
+        )
+
+
+class _Gemma4LinearWithDeferredOutputClip(nn.Module):
+    def __init__(self, linear: nn.Module, *, apply_input_clip: bool) -> None:
+        super().__init__()
+        self.linear = linear.linear
+        self.apply_input_clip = apply_input_clip
+        self.register_buffer("input_min", linear.input_min)
+        self.register_buffer("input_max", linear.input_max)
+        self.register_buffer("output_min", linear.output_min)
+        self.register_buffer("output_max", linear.output_max)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.apply_input_clip:
+            hidden_states = torch.clamp(
+                hidden_states,
+                self.input_min,
+                self.input_max,
+            )
+        return self.linear(hidden_states)
+
+
+class _Gemma4VisionMLP(nn.Module):
+    def __init__(self, mlp: nn.Module) -> None:
+        super().__init__()
+        if mlp.config.hidden_activation != "gelu_pytorch_tanh":
+            raise ValueError(
+                "Fused Gemma 4 vision MLP requires gelu_pytorch_tanh, got "
+                f"{mlp.config.hidden_activation}."
+            )
+        self.config = mlp.config
+        self.gate_proj = _Gemma4LinearWithDeferredOutputClip(
+            mlp.gate_proj, apply_input_clip=False
+        )
+        self.up_proj = _Gemma4LinearWithDeferredOutputClip(
+            mlp.up_proj, apply_input_clip=False
+        )
+        self.down_proj = _Gemma4LinearWithDeferredOutputClip(
+            mlp.down_proj, apply_input_clip=False
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate = self.gate_proj(hidden_states)
+        up = self.up_proj(hidden_states)
+        hidden_states = _gemma4_vision_gelu_mul_clip(
+            gate,
+            up,
+            self.gate_proj.output_min,
+            self.gate_proj.output_max,
+            self.up_proj.output_min,
+            self.up_proj.output_max,
+            self.down_proj.input_min,
+            self.down_proj.input_max,
+        )
+        return self.down_proj(hidden_states)
+
+
+class _Gemma4RMSNormWithOutputClip(nn.Module):
+    def __init__(
+        self,
+        rms_norm: nn.Module,
+        shared_input_clip: _Gemma4SharedInputClip,
+    ) -> None:
+        super().__init__()
+        self.weight = rms_norm.weight
+        self.eps = rms_norm.eps
+        self.shared_input_clip = shared_input_clip
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not (
+            hidden_states.is_cuda
+            and hidden_states.is_contiguous()
+            and hidden_states.dtype in (torch.float16, torch.bfloat16)
+        ):
+            raise RuntimeError(
+                "Fused Gemma 4 vision RMSNorm + clipping requires a contiguous "
+                "CUDA FP16 or BF16 input."
+            )
+        return _gemma4_vision_rmsnorm_clip(
+            hidden_states,
+            self.weight,
+            self.eps,
+            self.shared_input_clip.clip_min,
+            self.shared_input_clip.clip_max,
+        )
+
+
+class _Gemma4RMSNorm(nn.Module):
+    def __init__(
+        self,
+        rms_norm: nn.Module,
+        input_projection: _Gemma4LinearWithDeferredOutputClip | None = None,
+    ) -> None:
+        super().__init__()
+        self.eps = rms_norm.eps
+        self.has_weight = rms_norm.with_scale
+        if self.has_weight:
+            self.weight = rms_norm.weight
+        else:
+            self.register_parameter("weight", None)
+        if input_projection is None:
+            self.register_buffer("input_clip_min", None, persistent=False)
+            self.register_buffer("input_clip_max", None, persistent=False)
+        else:
+            self.register_buffer(
+                "input_clip_min", input_projection.output_min, persistent=False
+            )
+            self.register_buffer(
+                "input_clip_max", input_projection.output_max, persistent=False
+            )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not (
+            hidden_states.is_cuda
+            and hidden_states.is_contiguous()
+            and hidden_states.dtype in (torch.float16, torch.bfloat16)
+        ):
+            raise RuntimeError(
+                "Fused Gemma 4 vision RMSNorm requires a contiguous CUDA "
+                "FP16 or BF16 input."
+            )
+        return _gemma4_vision_rmsnorm(
+            hidden_states,
+            self.weight,
+            self.eps,
+            self.input_clip_min,
+            self.input_clip_max,
+            residual,
+        )
+
+
+def _gemma4_vision_encoder_layer_forward(
+    layer: nn.Module,
+    hidden_states: torch.Tensor,
+    position_embeddings: torch.Tensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.Tensor | None = None,
+    **kwargs: Any,
+) -> torch.Tensor:
+    """Run a vision encoder layer with fused post-norm residuals."""
+    residual = hidden_states
+    hidden_states = layer.input_layernorm(hidden_states)
+    hidden_states, _ = layer.self_attn(
+        hidden_states=hidden_states,
+        position_embeddings=position_embeddings,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        **kwargs,
+    )
+    hidden_states = layer.post_attention_layernorm(hidden_states, residual)
+
+    residual = hidden_states
+    hidden_states = layer.pre_feedforward_layernorm(hidden_states)
+    hidden_states = layer.mlp(hidden_states)
+    return layer.post_feedforward_layernorm(hidden_states, residual)
+
+
+def _fuse_gemma4_vision_layers(
+    vision_tower: nn.Module,
+) -> list[_Gemma4SharedInputClip]:
+    shared_clips = []
+    for layer in vision_tower.encoder.layers:
+        attention = layer.self_attn
+        attention_clip = _Gemma4SharedInputClip(
+            (attention.q_proj, attention.k_proj, attention.v_proj)
+        )
+        for projection_name in ("q_proj", "k_proj", "v_proj"):
+            projection = getattr(attention, projection_name)
+            setattr(
+                attention,
+                projection_name,
+                _Gemma4LinearWithDeferredOutputClip(projection, apply_input_clip=False),
+            )
+        attention.q_norm = _Gemma4RMSNorm(attention.q_norm, attention.q_proj)
+        attention.k_norm = _Gemma4RMSNorm(attention.k_norm, attention.k_proj)
+        attention.v_norm = _Gemma4RMSNorm(attention.v_norm, attention.v_proj)
+        attention.o_proj = _Gemma4LinearWithDeferredOutputClip(
+            attention.o_proj, apply_input_clip=True
+        )
+        layer.input_layernorm = _Gemma4RMSNormWithOutputClip(
+            layer.input_layernorm,
+            attention_clip,
+        )
+        layer.post_attention_layernorm = _Gemma4RMSNorm(
+            layer.post_attention_layernorm, attention.o_proj
+        )
+        shared_clips.append(attention_clip)
+
+        mlp = layer.mlp
+        mlp_clip = _Gemma4SharedInputClip((mlp.gate_proj, mlp.up_proj))
+        layer.pre_feedforward_layernorm = _Gemma4RMSNormWithOutputClip(
+            layer.pre_feedforward_layernorm,
+            mlp_clip,
+        )
+        layer.mlp = _Gemma4VisionMLP(mlp)
+        layer.post_feedforward_layernorm = _Gemma4RMSNorm(
+            layer.post_feedforward_layernorm, layer.mlp.down_proj
+        )
+        layer.forward = types.MethodType(_gemma4_vision_encoder_layer_forward, layer)
+        shared_clips.append(mlp_clip)
+    return shared_clips
 
 
 def _get_max_soft_tokens(
@@ -1070,6 +1512,19 @@ class Gemma4ForConditionalGeneration(
                 prefix=maybe_prefix(prefix, "vision_tower"),
             )
 
+        self._vision_use_cudnn_sdpa = envs.VLLM_GEMMA4_VISION_USE_CUDNN_SDPA
+        if self._vision_use_cudnn_sdpa:
+            logger.info("Using cuDNN SDPA for Gemma 4 vision attention.")
+        self._vision_shared_input_clips: list[_Gemma4SharedInputClip] = []
+        if config.vision_config.use_clipped_linears:
+            self._vision_shared_input_clips = _fuse_gemma4_vision_layers(
+                self.vision_tower
+            )
+            logger.info(
+                "Using fused Triton RMSNorm + shared input clipping for "
+                "Gemma 4 vision attention and MLP projections."
+            )
+
         # ---- Audio tower (variants with audio_config) ----
         if config.audio_config is not None:
             with self._mark_tower_model(vllm_config, "audio"):
@@ -1317,11 +1772,12 @@ class Gemma4ForConditionalGeneration(
                     pp_tensor,
                     pad_tensor,
                 ).to(self.model_dtype)
-                encoder_outputs = vt.encoder(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=~pad_tensor,
-                    pixel_position_ids=pp_tensor,
-                )
+                with _gemma4_vision_attention_backend(self._vision_use_cudnn_sdpa):
+                    encoder_outputs = vt.encoder(
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=~pad_tensor,
+                        pixel_position_ids=pp_tensor,
+                    )
                 hidden_states = encoder_outputs.last_hidden_state
 
                 for i, (orig_idx, _, _) in enumerate(chunk_items):
@@ -1426,11 +1882,12 @@ class Gemma4ForConditionalGeneration(
                 pp_chunk,
                 pad_chunk,
             ).to(self.model_dtype)
-            encoder_outputs = vt.encoder(
-                inputs_embeds=inputs_embeds,
-                attention_mask=~pad_chunk,
-                pixel_position_ids=pp_chunk,
-            )
+            with _gemma4_vision_attention_backend(self._vision_use_cudnn_sdpa):
+                encoder_outputs = vt.encoder(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=~pad_chunk,
+                    pixel_position_ids=pp_chunk,
+                )
             last_hidden_states_list.append(encoder_outputs.last_hidden_state)
 
         last_hidden_states = torch.cat(last_hidden_states_list, dim=0)
@@ -1892,11 +2349,12 @@ class Gemma4ForConditionalGeneration(
             pad_tensor,
         ).to(self.model_dtype)
 
-        encoder_outputs = vt.encoder(
-            inputs_embeds=inputs_embeds,
-            attention_mask=~pad_tensor,
-            pixel_position_ids=pixel_position_ids,
-        )
+        with _gemma4_vision_attention_backend(self._vision_use_cudnn_sdpa):
+            encoder_outputs = vt.encoder(
+                inputs_embeds=inputs_embeds,
+                attention_mask=~pad_tensor,
+                pixel_position_ids=pixel_position_ids,
+            )
         hidden_states = encoder_outputs.last_hidden_state
 
         pool_ratio = getattr(vt.config, "pooling_kernel_size", 2) ** 2
@@ -2107,7 +2565,15 @@ class Gemma4ForConditionalGeneration(
             self,
             ignore_unexpected_prefixes=ignore_prefixes,
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        for group_index, shared_clip in enumerate(self._vision_shared_input_clips):
+            if not shared_clip.validate():
+                raise ValueError(
+                    "Fused Gemma 4 vision RMSNorm + clipping requires equal "
+                    "input clipping bounds for every projection in group "
+                    f"{group_index}."
+                )
+        return loaded_weights
 
     # ------------------------------------------------------------------ #
     # LoRA / multimodal mapping
