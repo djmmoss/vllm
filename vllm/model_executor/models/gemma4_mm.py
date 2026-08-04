@@ -16,9 +16,9 @@ reason about temporal order.
 
 import math
 import os
+import types
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from types import MethodType
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import numpy as np
@@ -336,18 +336,18 @@ class _Gemma4SharedInputClip:
         )
 
 
-class _Gemma4LinearWithoutOutputClip(nn.Module):
-    def __init__(self, linear: nn.Module, *, clip_input: bool) -> None:
+class _Gemma4LinearWithDeferredOutputClip(nn.Module):
+    def __init__(self, linear: nn.Module, *, apply_input_clip: bool) -> None:
         super().__init__()
         self.linear = linear.linear
-        self.clip_input = clip_input
+        self.apply_input_clip = apply_input_clip
         self.register_buffer("input_min", linear.input_min)
         self.register_buffer("input_max", linear.input_max)
         self.register_buffer("output_min", linear.output_min)
         self.register_buffer("output_max", linear.output_max)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.clip_input:
+        if self.apply_input_clip:
             hidden_states = torch.clamp(
                 hidden_states,
                 self.input_min,
@@ -365,9 +365,15 @@ class _Gemma4VisionMLP(nn.Module):
                 f"{mlp.config.hidden_activation}."
             )
         self.config = mlp.config
-        self.gate_proj = _Gemma4LinearWithoutOutputClip(mlp.gate_proj, clip_input=False)
-        self.up_proj = _Gemma4LinearWithoutOutputClip(mlp.up_proj, clip_input=False)
-        self.down_proj = _Gemma4LinearWithoutOutputClip(mlp.down_proj, clip_input=False)
+        self.gate_proj = _Gemma4LinearWithDeferredOutputClip(
+            mlp.gate_proj, apply_input_clip=False
+        )
+        self.up_proj = _Gemma4LinearWithDeferredOutputClip(
+            mlp.up_proj, apply_input_clip=False
+        )
+        self.down_proj = _Gemma4LinearWithDeferredOutputClip(
+            mlp.down_proj, apply_input_clip=False
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate = self.gate_proj(hidden_states)
@@ -385,7 +391,7 @@ class _Gemma4VisionMLP(nn.Module):
         return self.down_proj(hidden_states)
 
 
-class _Gemma4RMSNormClip(nn.Module):
+class _Gemma4RMSNormWithOutputClip(nn.Module):
     def __init__(
         self,
         rms_norm: nn.Module,
@@ -419,7 +425,7 @@ class _Gemma4RMSNorm(nn.Module):
     def __init__(
         self,
         rms_norm: nn.Module,
-        input_projection: _Gemma4LinearWithoutOutputClip | None = None,
+        input_projection: _Gemma4LinearWithDeferredOutputClip | None = None,
     ) -> None:
         super().__init__()
         self.eps = rms_norm.eps
@@ -463,13 +469,6 @@ class _Gemma4RMSNorm(nn.Module):
         )
 
 
-def _convert_gemma4_vision_rmsnorm(
-    rms_norm: nn.Module,
-    input_projection: _Gemma4LinearWithoutOutputClip | None = None,
-) -> _Gemma4RMSNorm:
-    return _Gemma4RMSNorm(rms_norm, input_projection)
-
-
 def _gemma4_vision_encoder_layer_forward(
     layer: nn.Module,
     hidden_states: torch.Tensor,
@@ -478,6 +477,7 @@ def _gemma4_vision_encoder_layer_forward(
     position_ids: torch.Tensor | None = None,
     **kwargs: Any,
 ) -> torch.Tensor:
+    """Run a vision encoder layer with fused post-norm residuals."""
     residual = hidden_states
     hidden_states = layer.input_layernorm(hidden_states)
     hidden_states, _ = layer.self_attn(
@@ -495,7 +495,7 @@ def _gemma4_vision_encoder_layer_forward(
     return layer.post_feedforward_layernorm(hidden_states, residual)
 
 
-def _enable_gemma4_vision_triton_rmsnorm_clip(
+def _fuse_gemma4_vision_layers(
     vision_tower: nn.Module,
 ) -> list[_Gemma4SharedInputClip]:
     shared_clips = []
@@ -504,47 +504,39 @@ def _enable_gemma4_vision_triton_rmsnorm_clip(
         attention_clip = _Gemma4SharedInputClip(
             (attention.q_proj, attention.k_proj, attention.v_proj)
         )
-        attention.q_proj = _Gemma4LinearWithoutOutputClip(
-            attention.q_proj, clip_input=False
+        for projection_name in ("q_proj", "k_proj", "v_proj"):
+            projection = getattr(attention, projection_name)
+            setattr(
+                attention,
+                projection_name,
+                _Gemma4LinearWithDeferredOutputClip(projection, apply_input_clip=False),
+            )
+        attention.q_norm = _Gemma4RMSNorm(attention.q_norm, attention.q_proj)
+        attention.k_norm = _Gemma4RMSNorm(attention.k_norm, attention.k_proj)
+        attention.v_norm = _Gemma4RMSNorm(attention.v_norm, attention.v_proj)
+        attention.o_proj = _Gemma4LinearWithDeferredOutputClip(
+            attention.o_proj, apply_input_clip=True
         )
-        attention.k_proj = _Gemma4LinearWithoutOutputClip(
-            attention.k_proj, clip_input=False
-        )
-        attention.v_proj = _Gemma4LinearWithoutOutputClip(
-            attention.v_proj, clip_input=False
-        )
-        attention.q_norm = _convert_gemma4_vision_rmsnorm(
-            attention.q_norm, attention.q_proj
-        )
-        attention.k_norm = _convert_gemma4_vision_rmsnorm(
-            attention.k_norm, attention.k_proj
-        )
-        attention.v_norm = _convert_gemma4_vision_rmsnorm(
-            attention.v_norm, attention.v_proj
-        )
-        attention.o_proj = _Gemma4LinearWithoutOutputClip(
-            attention.o_proj, clip_input=True
-        )
-        layer.input_layernorm = _Gemma4RMSNormClip(
+        layer.input_layernorm = _Gemma4RMSNormWithOutputClip(
             layer.input_layernorm,
             attention_clip,
         )
-        layer.post_attention_layernorm = _convert_gemma4_vision_rmsnorm(
+        layer.post_attention_layernorm = _Gemma4RMSNorm(
             layer.post_attention_layernorm, attention.o_proj
         )
         shared_clips.append(attention_clip)
 
         mlp = layer.mlp
         mlp_clip = _Gemma4SharedInputClip((mlp.gate_proj, mlp.up_proj))
-        layer.pre_feedforward_layernorm = _Gemma4RMSNormClip(
+        layer.pre_feedforward_layernorm = _Gemma4RMSNormWithOutputClip(
             layer.pre_feedforward_layernorm,
             mlp_clip,
         )
         layer.mlp = _Gemma4VisionMLP(mlp)
-        layer.post_feedforward_layernorm = _convert_gemma4_vision_rmsnorm(
+        layer.post_feedforward_layernorm = _Gemma4RMSNorm(
             layer.post_feedforward_layernorm, layer.mlp.down_proj
         )
-        layer.forward = MethodType(_gemma4_vision_encoder_layer_forward, layer)
+        layer.forward = types.MethodType(_gemma4_vision_encoder_layer_forward, layer)
         shared_clips.append(mlp_clip)
     return shared_clips
 
@@ -1518,10 +1510,10 @@ class Gemma4ForConditionalGeneration(
         self._vision_use_cudnn_sdpa = _get_gemma4_vision_use_cudnn_sdpa()
         if self._vision_use_cudnn_sdpa:
             logger.info("Using cuDNN SDPA for Gemma 4 vision attention.")
-        self._vision_rmsnorm_clip_states: list[_Gemma4SharedInputClip] = []
+        self._vision_shared_input_clips: list[_Gemma4SharedInputClip] = []
         if config.vision_config.use_clipped_linears:
-            self._vision_rmsnorm_clip_states = (
-                _enable_gemma4_vision_triton_rmsnorm_clip(self.vision_tower)
+            self._vision_shared_input_clips = _fuse_gemma4_vision_layers(
+                self.vision_tower
             )
             logger.info(
                 "Using fused Triton RMSNorm + shared input clipping for "
@@ -2387,7 +2379,7 @@ class Gemma4ForConditionalGeneration(
             ignore_unexpected_prefixes=ignore_prefixes,
         )
         loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        for group_index, shared_clip in enumerate(self._vision_rmsnorm_clip_states):
+        for group_index, shared_clip in enumerate(self._vision_shared_input_clips):
             if not shared_clip.validate():
                 raise ValueError(
                     "Fused Gemma 4 vision RMSNorm + clipping requires equal "
