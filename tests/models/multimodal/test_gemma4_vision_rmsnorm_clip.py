@@ -9,6 +9,7 @@ from torch import nn
 
 from vllm.model_executor.models.gemma4_mm import (
     _convert_gemma4_vision_rmsnorm,
+    _Gemma4LinearWithoutOutputClip,
     _Gemma4OutputClippedLinear,
     _Gemma4RMSNormClip,
     _Gemma4SharedInputClip,
@@ -72,6 +73,30 @@ def test_gemma4_output_clipped_linear_requires_preclipped_input() -> None:
         torch.tensor([[-3.0, 3.0]]),
     )
     torch.testing.assert_close(projection(hidden_states), torch.tensor([[-2.0, 2.0]]))
+
+
+@pytest.mark.parametrize(
+    ("clip_input", "expected"),
+    [
+        (False, [-8.0, 8.0]),
+        (True, [-4.0, 4.0]),
+    ],
+)
+def test_gemma4_linear_without_output_clip(
+    clip_input: bool,
+    expected: list[float],
+) -> None:
+    projection = _ClippedLinear(2, -2.0, 2.0)
+    with torch.no_grad():
+        projection.linear.weight.copy_(2 * torch.eye(2))
+    wrapped_projection = _Gemma4LinearWithoutOutputClip(
+        projection, clip_input=clip_input
+    )
+
+    torch.testing.assert_close(
+        wrapped_projection(torch.tensor([[-4.0, 4.0]])),
+        torch.tensor([expected]),
+    )
 
 
 def test_gemma4_rmsnorm_clip_rejects_non_cuda_input() -> None:
@@ -156,6 +181,53 @@ def test_gemma4_vision_fused_rmsnorm_cuda_graph(with_scale: bool) -> None:
         weight = torch.ones(hidden_size, device="cuda", dtype=torch.bfloat16)
     fused_norm = _convert_gemma4_vision_rmsnorm(rms_norm).cuda()
     expected = _rmsnorm_reference(hidden_states, weight, rms_norm.eps)
+
+    actual = fused_norm(hidden_states)
+    torch.testing.assert_close(actual, expected, atol=0.015625, rtol=0.01)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = fused_norm(hidden_states)
+    graph.replay()
+    torch.testing.assert_close(replayed, expected, atol=0.015625, rtol=0.01)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("with_scale", [False, True])
+def test_gemma4_vision_fused_input_clip_rmsnorm_cuda_graph(
+    with_scale: bool,
+) -> None:
+    torch.manual_seed(0)
+    hidden_size = 72
+    hidden_states = 8 * torch.randn(
+        2520,
+        16,
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    projection = _Gemma4LinearWithoutOutputClip(
+        _ClippedLinear(hidden_size, -2.0, 2.0).cuda(),
+        clip_input=False,
+    )
+    rms_norm = SimpleNamespace(eps=1e-6, with_scale=with_scale)
+    if with_scale:
+        rms_norm.weight = nn.Parameter(
+            torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
+        )
+        weight = rms_norm.weight
+    else:
+        weight = torch.ones(hidden_size, device="cuda", dtype=torch.bfloat16)
+    fused_norm = _convert_gemma4_vision_rmsnorm(rms_norm, projection).cuda()
+    expected = _rmsnorm_reference(
+        torch.clamp(
+            hidden_states,
+            projection.output_min,
+            projection.output_max,
+        ),
+        weight,
+        rms_norm.eps,
+    )
 
     actual = fused_norm(hidden_states)
     torch.testing.assert_close(actual, expected, atol=0.015625, rtol=0.01)

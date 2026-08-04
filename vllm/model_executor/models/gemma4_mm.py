@@ -145,9 +145,12 @@ def _gemma4_vision_rmsnorm_kernel(
     input_ptr,
     weight_ptr,
     output_ptr,
+    input_clip_min_ptr,
+    input_clip_max_ptr,
     n_cols: tl.constexpr,
     eps: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
+    HAS_INPUT_CLIP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -157,6 +160,10 @@ def _gemma4_vision_rmsnorm_kernel(
     output_row = output_ptr + row * n_cols
 
     values = tl.load(input_row + offsets, mask=mask, other=0.0).to(tl.float32)
+    if HAS_INPUT_CLIP:
+        input_clip_min = tl.load(input_clip_min_ptr).to(tl.float32)
+        input_clip_max = tl.load(input_clip_max_ptr).to(tl.float32)
+        values = tl.maximum(tl.minimum(values, input_clip_max), input_clip_min)
     mean_square = tl.sum(values * values, axis=0) / n_cols
     values = values * tl.rsqrt(mean_square + eps)
     if HAS_WEIGHT:
@@ -198,6 +205,8 @@ def _gemma4_vision_rmsnorm(
     hidden_states: torch.Tensor,
     weight: torch.Tensor | None,
     eps: float,
+    input_clip_min: torch.Tensor | None = None,
+    input_clip_max: torch.Tensor | None = None,
 ) -> torch.Tensor:
     hidden_size = hidden_states.shape[-1]
     output = torch.empty_like(hidden_states)
@@ -211,9 +220,12 @@ def _gemma4_vision_rmsnorm(
         hidden_states,
         weight if weight is not None else hidden_states,
         output,
+        input_clip_min if input_clip_min is not None else hidden_states,
+        input_clip_max if input_clip_max is not None else hidden_states,
         n_cols=hidden_size,
         eps=eps,
         HAS_WEIGHT=weight is not None,
+        HAS_INPUT_CLIP=input_clip_min is not None,
         BLOCK_SIZE=block_size,
         num_warps=num_warps,
     )
@@ -256,6 +268,26 @@ class _Gemma4OutputClippedLinear(nn.Module):
         return torch.clamp(hidden_states, self.output_min, self.output_max)
 
 
+class _Gemma4LinearWithoutOutputClip(nn.Module):
+    def __init__(self, linear: nn.Module, *, clip_input: bool) -> None:
+        super().__init__()
+        self.linear = linear.linear
+        self.clip_input = clip_input
+        self.register_buffer("input_min", linear.input_min)
+        self.register_buffer("input_max", linear.input_max)
+        self.register_buffer("output_min", linear.output_min)
+        self.register_buffer("output_max", linear.output_max)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.clip_input:
+            hidden_states = torch.clamp(
+                hidden_states,
+                self.input_min,
+                self.input_max,
+            )
+        return self.linear(hidden_states)
+
+
 class _Gemma4RMSNormClip(nn.Module):
     def __init__(
         self,
@@ -287,7 +319,11 @@ class _Gemma4RMSNormClip(nn.Module):
 
 
 class _Gemma4RMSNorm(nn.Module):
-    def __init__(self, rms_norm: nn.Module) -> None:
+    def __init__(
+        self,
+        rms_norm: nn.Module,
+        input_projection: _Gemma4LinearWithoutOutputClip | None = None,
+    ) -> None:
         super().__init__()
         self.eps = rms_norm.eps
         self.has_weight = rms_norm.with_scale
@@ -295,6 +331,16 @@ class _Gemma4RMSNorm(nn.Module):
             self.weight = rms_norm.weight
         else:
             self.register_parameter("weight", None)
+        if input_projection is None:
+            self.register_buffer("input_clip_min", None, persistent=False)
+            self.register_buffer("input_clip_max", None, persistent=False)
+        else:
+            self.register_buffer(
+                "input_clip_min", input_projection.output_min, persistent=False
+            )
+            self.register_buffer(
+                "input_clip_max", input_projection.output_max, persistent=False
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not (
@@ -306,11 +352,20 @@ class _Gemma4RMSNorm(nn.Module):
                 "Fused Gemma 4 vision RMSNorm requires a contiguous CUDA "
                 "FP16 or BF16 input."
             )
-        return _gemma4_vision_rmsnorm(hidden_states, self.weight, self.eps)
+        return _gemma4_vision_rmsnorm(
+            hidden_states,
+            self.weight,
+            self.eps,
+            self.input_clip_min,
+            self.input_clip_max,
+        )
 
 
-def _convert_gemma4_vision_rmsnorm(rms_norm: nn.Module) -> _Gemma4RMSNorm:
-    return _Gemma4RMSNorm(rms_norm)
+def _convert_gemma4_vision_rmsnorm(
+    rms_norm: nn.Module,
+    input_projection: _Gemma4LinearWithoutOutputClip | None = None,
+) -> _Gemma4RMSNorm:
+    return _Gemma4RMSNorm(rms_norm, input_projection)
 
 
 def _enable_gemma4_vision_triton_rmsnorm_clip(
@@ -322,18 +377,33 @@ def _enable_gemma4_vision_triton_rmsnorm_clip(
         attention_clip = _Gemma4SharedInputClip(
             (attention.q_proj, attention.k_proj, attention.v_proj)
         )
-        attention.q_proj = _Gemma4OutputClippedLinear(attention.q_proj)
-        attention.k_proj = _Gemma4OutputClippedLinear(attention.k_proj)
-        attention.v_proj = _Gemma4OutputClippedLinear(attention.v_proj)
-        attention.q_norm = _convert_gemma4_vision_rmsnorm(attention.q_norm)
-        attention.k_norm = _convert_gemma4_vision_rmsnorm(attention.k_norm)
-        attention.v_norm = _convert_gemma4_vision_rmsnorm(attention.v_norm)
+        attention.q_proj = _Gemma4LinearWithoutOutputClip(
+            attention.q_proj, clip_input=False
+        )
+        attention.k_proj = _Gemma4LinearWithoutOutputClip(
+            attention.k_proj, clip_input=False
+        )
+        attention.v_proj = _Gemma4LinearWithoutOutputClip(
+            attention.v_proj, clip_input=False
+        )
+        attention.q_norm = _convert_gemma4_vision_rmsnorm(
+            attention.q_norm, attention.q_proj
+        )
+        attention.k_norm = _convert_gemma4_vision_rmsnorm(
+            attention.k_norm, attention.k_proj
+        )
+        attention.v_norm = _convert_gemma4_vision_rmsnorm(
+            attention.v_norm, attention.v_proj
+        )
+        attention.o_proj = _Gemma4LinearWithoutOutputClip(
+            attention.o_proj, clip_input=True
+        )
         layer.input_layernorm = _Gemma4RMSNormClip(
             layer.input_layernorm,
             attention_clip,
         )
         layer.post_attention_layernorm = _convert_gemma4_vision_rmsnorm(
-            layer.post_attention_layernorm
+            layer.post_attention_layernorm, attention.o_proj
         )
         shared_clips.append(attention_clip)
 
@@ -341,12 +411,13 @@ def _enable_gemma4_vision_triton_rmsnorm_clip(
         mlp_clip = _Gemma4SharedInputClip((mlp.gate_proj, mlp.up_proj))
         mlp.gate_proj = _Gemma4OutputClippedLinear(mlp.gate_proj)
         mlp.up_proj = _Gemma4OutputClippedLinear(mlp.up_proj)
+        mlp.down_proj = _Gemma4LinearWithoutOutputClip(mlp.down_proj, clip_input=True)
         layer.pre_feedforward_layernorm = _Gemma4RMSNormClip(
             layer.pre_feedforward_layernorm,
             mlp_clip,
         )
         layer.post_feedforward_layernorm = _convert_gemma4_vision_rmsnorm(
-            layer.post_feedforward_layernorm
+            layer.post_feedforward_layernorm, mlp.down_proj
         )
         shared_clips.append(mlp_clip)
     return shared_clips
