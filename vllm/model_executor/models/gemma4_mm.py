@@ -140,6 +140,31 @@ def _gemma4_vision_rmsnorm_clip_kernel(
     tl.store(output_row + offsets, values, mask=mask)
 
 
+@triton.jit
+def _gemma4_vision_rmsnorm_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    n_cols: tl.constexpr,
+    eps: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_cols
+    input_row = input_ptr + row * n_cols
+    output_row = output_ptr + row * n_cols
+
+    values = tl.load(input_row + offsets, mask=mask, other=0.0).to(tl.float32)
+    mean_square = tl.sum(values * values, axis=0) / n_cols
+    values = values * tl.rsqrt(mean_square + eps)
+    if HAS_WEIGHT:
+        weights = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        values *= weights
+    tl.store(output_row + offsets, values, mask=mask)
+
+
 def _gemma4_vision_rmsnorm_clip(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -163,6 +188,32 @@ def _gemma4_vision_rmsnorm_clip(
         clip_max,
         n_cols=hidden_size,
         eps=eps,
+        BLOCK_SIZE=block_size,
+        num_warps=num_warps,
+    )
+    return output
+
+
+def _gemma4_vision_rmsnorm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor | None,
+    eps: float,
+) -> torch.Tensor:
+    hidden_size = hidden_states.shape[-1]
+    output = torch.empty_like(hidden_states)
+    if output.numel() == 0:
+        return output
+
+    block_size = triton.next_power_of_2(hidden_size)
+    num_rows = hidden_states.numel() // hidden_size
+    num_warps = 4 if block_size <= 1024 else 8
+    _gemma4_vision_rmsnorm_kernel[(num_rows,)](
+        hidden_states,
+        weight if weight is not None else hidden_states,
+        output,
+        n_cols=hidden_size,
+        eps=eps,
+        HAS_WEIGHT=weight is not None,
         BLOCK_SIZE=block_size,
         num_warps=num_warps,
     )
@@ -235,6 +286,33 @@ class _Gemma4RMSNormClip(nn.Module):
         )
 
 
+class _Gemma4RMSNorm(nn.Module):
+    def __init__(self, rms_norm: nn.Module) -> None:
+        super().__init__()
+        self.eps = rms_norm.eps
+        self.has_weight = rms_norm.with_scale
+        if self.has_weight:
+            self.weight = rms_norm.weight
+        else:
+            self.register_parameter("weight", None)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not (
+            hidden_states.is_cuda
+            and hidden_states.is_contiguous()
+            and hidden_states.dtype in (torch.float16, torch.bfloat16)
+        ):
+            raise RuntimeError(
+                "Fused Gemma 4 vision RMSNorm requires a contiguous CUDA "
+                "FP16 or BF16 input."
+            )
+        return _gemma4_vision_rmsnorm(hidden_states, self.weight, self.eps)
+
+
+def _convert_gemma4_vision_rmsnorm(rms_norm: nn.Module) -> _Gemma4RMSNorm:
+    return _Gemma4RMSNorm(rms_norm)
+
+
 def _enable_gemma4_vision_triton_rmsnorm_clip(
     vision_tower: nn.Module,
 ) -> list[_Gemma4SharedInputClip]:
@@ -247,9 +325,15 @@ def _enable_gemma4_vision_triton_rmsnorm_clip(
         attention.q_proj = _Gemma4OutputClippedLinear(attention.q_proj)
         attention.k_proj = _Gemma4OutputClippedLinear(attention.k_proj)
         attention.v_proj = _Gemma4OutputClippedLinear(attention.v_proj)
+        attention.q_norm = _convert_gemma4_vision_rmsnorm(attention.q_norm)
+        attention.k_norm = _convert_gemma4_vision_rmsnorm(attention.k_norm)
+        attention.v_norm = _convert_gemma4_vision_rmsnorm(attention.v_norm)
         layer.input_layernorm = _Gemma4RMSNormClip(
             layer.input_layernorm,
             attention_clip,
+        )
+        layer.post_attention_layernorm = _convert_gemma4_vision_rmsnorm(
+            layer.post_attention_layernorm
         )
         shared_clips.append(attention_clip)
 
@@ -260,6 +344,9 @@ def _enable_gemma4_vision_triton_rmsnorm_clip(
         layer.pre_feedforward_layernorm = _Gemma4RMSNormClip(
             layer.pre_feedforward_layernorm,
             mlp_clip,
+        )
+        layer.post_feedforward_layernorm = _convert_gemma4_vision_rmsnorm(
+            layer.post_feedforward_layernorm
         )
         shared_clips.append(mlp_clip)
     return shared_clips
