@@ -226,6 +226,49 @@ def test_gemma4_vision_fused_input_clip_rmsnorm_cuda_graph(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_gemma4_vision_fused_clip_rmsnorm_residual_cuda_graph() -> None:
+    torch.manual_seed(0)
+    hidden_size = 1152
+    hidden_states = 8 * torch.randn(
+        2520,
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    residual = torch.randn_like(hidden_states)
+    projection = _Gemma4LinearWithoutOutputClip(
+        _ClippedLinear(hidden_size, -2.0, 2.0).cuda(),
+        clip_input=False,
+    )
+    rms_norm = SimpleNamespace(
+        eps=1e-6,
+        with_scale=True,
+        weight=nn.Parameter(
+            torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
+        ),
+    )
+    fused_norm = _convert_gemma4_vision_rmsnorm(rms_norm, projection).cuda()
+    expected = residual + _rmsnorm_reference(
+        torch.clamp(
+            hidden_states,
+            projection.output_min,
+            projection.output_max,
+        ),
+        rms_norm.weight,
+        rms_norm.eps,
+    )
+
+    actual = fused_norm(hidden_states, residual)
+    torch.testing.assert_close(actual, expected, atol=0.015625, rtol=0.01)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = fused_norm(hidden_states, residual)
+    graph.replay()
+    torch.testing.assert_close(replayed, expected, atol=0.015625, rtol=0.01)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 def test_gemma4_vision_fused_gelu_mul_clip_cuda_graph() -> None:
     torch.manual_seed(0)
     gate = 8 * torch.randn(

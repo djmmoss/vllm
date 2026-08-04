@@ -18,6 +18,7 @@ import math
 import os
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from types import MethodType
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import numpy as np
@@ -145,12 +146,14 @@ def _gemma4_vision_rmsnorm_kernel(
     input_ptr,
     weight_ptr,
     output_ptr,
+    residual_ptr,
     input_clip_min_ptr,
     input_clip_max_ptr,
     n_cols: tl.constexpr,
     eps: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_INPUT_CLIP: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -169,6 +172,11 @@ def _gemma4_vision_rmsnorm_kernel(
     if HAS_WEIGHT:
         weights = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         values *= weights
+    if HAS_RESIDUAL:
+        values = values.to(output_ptr.dtype.element_ty).to(tl.float32)
+        residual_row = residual_ptr + row * n_cols
+        residual = tl.load(residual_row + offsets, mask=mask, other=0.0).to(tl.float32)
+        values += residual
     tl.store(output_row + offsets, values, mask=mask)
 
 
@@ -248,6 +256,7 @@ def _gemma4_vision_rmsnorm(
     eps: float,
     input_clip_min: torch.Tensor | None = None,
     input_clip_max: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
 ) -> torch.Tensor:
     hidden_size = hidden_states.shape[-1]
     output = torch.empty_like(hidden_states)
@@ -261,12 +270,14 @@ def _gemma4_vision_rmsnorm(
         hidden_states,
         weight if weight is not None else hidden_states,
         output,
+        residual if residual is not None else hidden_states,
         input_clip_min if input_clip_min is not None else hidden_states,
         input_clip_max if input_clip_max is not None else hidden_states,
         n_cols=hidden_size,
         eps=eps,
         HAS_WEIGHT=weight is not None,
         HAS_INPUT_CLIP=input_clip_min is not None,
+        HAS_RESIDUAL=residual is not None,
         BLOCK_SIZE=block_size,
         num_warps=num_warps,
     )
@@ -428,7 +439,11 @@ class _Gemma4RMSNorm(nn.Module):
                 "input_clip_max", input_projection.output_max, persistent=False
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if not (
             hidden_states.is_cuda
             and hidden_states.is_contiguous()
@@ -444,6 +459,7 @@ class _Gemma4RMSNorm(nn.Module):
             self.eps,
             self.input_clip_min,
             self.input_clip_max,
+            residual,
         )
 
 
@@ -452,6 +468,31 @@ def _convert_gemma4_vision_rmsnorm(
     input_projection: _Gemma4LinearWithoutOutputClip | None = None,
 ) -> _Gemma4RMSNorm:
     return _Gemma4RMSNorm(rms_norm, input_projection)
+
+
+def _gemma4_vision_encoder_layer_forward(
+    layer: nn.Module,
+    hidden_states: torch.Tensor,
+    position_embeddings: torch.Tensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.Tensor | None = None,
+    **kwargs: Any,
+) -> torch.Tensor:
+    residual = hidden_states
+    hidden_states = layer.input_layernorm(hidden_states)
+    hidden_states, _ = layer.self_attn(
+        hidden_states=hidden_states,
+        position_embeddings=position_embeddings,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        **kwargs,
+    )
+    hidden_states = layer.post_attention_layernorm(hidden_states, residual)
+
+    residual = hidden_states
+    hidden_states = layer.pre_feedforward_layernorm(hidden_states)
+    hidden_states = layer.mlp(hidden_states)
+    return layer.post_feedforward_layernorm(hidden_states, residual)
 
 
 def _enable_gemma4_vision_triton_rmsnorm_clip(
@@ -503,6 +544,7 @@ def _enable_gemma4_vision_triton_rmsnorm_clip(
         layer.post_feedforward_layernorm = _convert_gemma4_vision_rmsnorm(
             layer.post_feedforward_layernorm, layer.mlp.down_proj
         )
+        layer.forward = MethodType(_gemma4_vision_encoder_layer_forward, layer)
         shared_clips.append(mlp_clip)
     return shared_clips
 
