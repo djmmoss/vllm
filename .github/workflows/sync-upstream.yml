@@ -1,0 +1,64 @@
+name: Sync Fork with Upstream
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Reset main to upstream
+        env:
+          BRANCH: main
+          UPSTREAM_REPO: vllm-project/vllm
+          WORKFLOW_PATH: .github/workflows/sync-upstream.yml
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${BRANCH}"
+
+          upstream_head="$(git rev-parse "upstream/${BRANCH}")"
+          current_parent=""
+          if git rev-parse HEAD^ >/dev/null 2>&1; then
+            current_parent="$(git rev-parse HEAD^)"
+          fi
+
+          if [ "${current_parent}" = "${upstream_head}" ]; then
+            other_paths="$(git diff --name-only "${current_parent}" HEAD | grep -vxF "${WORKFLOW_PATH}" || true)"
+            if [ -z "${other_paths}" ] && ! git diff --quiet "${current_parent}" HEAD -- "${WORKFLOW_PATH}"; then
+              echo "Fork main is already synced to upstream plus ${WORKFLOW_PATH}."
+              exit 0
+            fi
+          fi
+
+          workflow_contents="$(mktemp)"
+          cp "${WORKFLOW_PATH}" "${workflow_contents}"
+
+          git reset --hard "upstream/${BRANCH}"
+          mkdir -p "$(dirname "${WORKFLOW_PATH}")"
+          cp "${workflow_contents}" "${WORKFLOW_PATH}"
+
+          git add "${WORKFLOW_PATH}"
+          if git diff --cached --quiet; then
+            echo "No fork-local workflow changes to preserve."
+            exit 0
+          fi
+
+          git commit -m "Keep fork sync workflow"
+          git push --force-with-lease origin HEAD:"${BRANCH}"
